@@ -4,6 +4,8 @@ All notable changes to WEPWolf are documented here. The format follows [Keep a C
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-06-16
+
 ### Added
 
 - Capture ingest for pcap, pcapng, and gzip over raw 802.11, radiotap, Prism, AVS, PPI, and Linux cooked link layers, with tiered FCS recovery (ported from the WPAWolf front-end).
@@ -45,4 +47,5 @@ All notable changes to WEPWolf are documented here. The format follows [Keep a C
 - WEPWolf is passive and offline: it reads capture files only, and never captures traffic, injects frames, or touches a radio.
 - On the aircrack-ng `wep_64_ptw.cap` reference capture it recovers the key in roughly a fifth of a second.
 
-[Unreleased]: https://github.com/StrongWind1/WEPWolf
+[Unreleased]: https://github.com/StrongWind1/WEPWolf/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/StrongWind1/WEPWolf/releases/tag/v0.1.0
