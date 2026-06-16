@@ -1,0 +1,165 @@
+[package]
+name = "wepwolf"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "Offline, passive WEP key recovery from 802.11 captures"
+license = "Apache-2.0"
+repository = "https://github.com/StrongWind1/WEPWolf"
+homepage = "https://github.com/StrongWind1/WEPWolf"
+documentation = "https://strongwind1.github.io/WEPWolf/"
+readme = "README.md"
+keywords = ["wifi", "security", "802.11", "wep", "pcap"]
+categories = ["command-line-utilities", "network-programming"]
+# Files shipped in the published crate: source, tests, and benches. The local
+# test data (ref/), the spec scratch (specs/), and the MkDocs site (docs/,
+# site/) are repository-only and are not part of the package.
+include = [
+    "/src/**/*",
+    "/tests/**/*",
+    "/benches/**/*",
+    "/build.rs",
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/README.md",
+    "/LICENSE",
+    "/CHANGELOG.md",
+]
+
+[package.metadata.cargo-machete]
+# md-5 is the package name but is imported as `md5`, which cargo-machete cannot map.
+ignored = ["md-5"]
+
+[dependencies]
+# Gzip decompression for .pcap.gz / .pcapng.gz inputs (pure-Rust backend; keeps
+# the cargo-deny supply-chain gate tight). Ported with the WPAWolf input layer.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+# IEEE 802.11 FCS verification -- IEEE CRC-32 (ISO 3309), SIMD-accelerated.
+# Ported with the WPAWolf link layer. NOTE: this is the on-air frame FCS, not
+# the WEP ICV (which crate::crypto::crc32 computes over the RC4-decrypted body).
+crc32fast = "1"
+# Cross-platform process RSS + total RAM for the FR-MEM-1 memory monitor.
+# Ported from the WPAWolf progress helpers; pinned to match its version.
+sysinfo = "0.39"
+# CLI argument parsing for the oneshot driver. Minimal feature set.
+clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "color"] }
+# MD5 for the 104-bit weak-key generator (RustCrypto). The keygen derives WEP
+# keys from passphrases; this is the standard "128-bit ASCII" derivation.
+md-5 = "0.11"
+# Work-stealing parallel iteration for the cross-BSSID attack sweep.
+rayon = "1"
+# Live ingest spinner (FR-UI). Native tree is lean (console + unicode-width);
+# its futures/wasm transitive deps are target-gated to wasm and never built here.
+indicatif = "0.18"
+
+# --- Benchmarks ---
+# Plain timed harness (no criterion) for the FR-PERF-4 parity numbers.
+[[bench]]
+name = "crack"
+harness = false
+
+# --- Build profiles ---
+[profile.dev]
+# opt-level 1 keeps debug-assertions and overflow-checks on (both independent of
+# the optimisation level) while letting the statistical-attack loops run several
+# times faster -- the synthetic PTW/KoreK recovery tests push 80k-120k samples
+# through the KSA, which is unusably slow at opt-level 0.
+opt-level = 1
+# Catch integer overflows in debug builds rather than wrapping silently.
+overflow-checks = true
+
+[profile.release]
+# Full link-time optimisation for maximum performance and smaller binary.
+lto = true
+# Single codegen unit forces cross-crate inlining; required for full LTO.
+codegen-units = 1
+# Abort on panic -- no unwinding machinery in the binary.
+panic = "abort"
+# Catch overflows in release too; remove only if profiling proves the cost.
+overflow-checks = true
+# Strip debug symbols from the release binary.
+strip = "symbols"
+
+[profile.test]
+# Match the dev profile: optimise enough that the heavy statistical-recovery
+# tests finish quickly, without dropping the arithmetic-overflow checks.
+opt-level = 1
+# Overflow checks in tests to catch arithmetic bugs.
+overflow-checks = true
+
+# --- Lint policy ---
+# Levels live here; per-lint thresholds and test relaxations live in clippy.toml.
+[lints.rust]
+# Unsafe is denied crate-wide and permitted only behind an explicit, reasoned
+# #[allow(unsafe_code)] in the audited SIMD kernels (src/simd.rs), each guarded
+# by runtime feature detection and the byte-exact-equals-scalar gate (FR-SIMD-2).
+unsafe_code = "deny"
+missing_docs = "warn"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+unused_import_braces = "warn"
+unused_qualifications = "warn"
+unused_lifetimes = "warn"
+trivial_casts = "warn"
+trivial_numeric_casts = "warn"
+elided_lifetimes_in_paths = "warn"
+explicit_outlives_requirements = "warn"
+keyword_idents = { level = "deny", priority = 1 }
+macro_use_extern_crate = "deny"
+non_ascii_idents = "forbid"
+single_use_lifetimes = "warn"
+unused_crate_dependencies = "warn"
+unused_extern_crates = "warn"
+variant_size_differences = "warn"
+
+[lints.clippy]
+# Lint groups -- enable everything, then allow specific false-positive-prone lints below.
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+cargo = { level = "warn", priority = -1 }
+
+# --- Restriction lints (cherry-picked, not the whole group) ---
+# No #[allow(...)] without a reason string.
+allow_attributes_without_reason = "warn"
+# No dbg!() in committed code.
+dbg_macro = "deny"
+# No todo!() / unimplemented!() -- use proper error handling.
+todo = "deny"
+unimplemented = "deny"
+# Prefer .clone() / .to_owned() over .to_string() for non-Display conversions.
+str_to_string = "warn"
+# No std::mem::forget -- almost always a bug.
+mem_forget = "deny"
+# No indexing into slices -- use .get() for safe access.
+indexing_slicing = "warn"
+# No unwrap/expect in library code -- force proper error propagation.
+unwrap_used = "warn"
+expect_used = "warn"
+# No panic! -- handle errors properly.
+panic = "warn"
+# Detect lossy float-to-int or int-to-float casts.
+cast_possible_truncation = "warn"
+cast_sign_loss = "warn"
+cast_precision_loss = "warn"
+cast_possible_wrap = "warn"
+# Warn on large enum variant size differences (consider Box).
+large_enum_variant = "warn"
+# No .unwrap() on mutex locks -- can panic on poisoning.
+mutex_atomic = "warn"
+# Explicit iteration: prefer .iter() / .iter_mut() over implicit deref.
+explicit_iter_loop = "warn"
+explicit_into_iter_loop = "warn"
+# Require `Self` in impl blocks where possible.
+use_self = "warn"
+# Warn on needlessly borrowed references.
+needless_borrow = "warn"
+needless_pass_by_value = "warn"
+
+# --- Allow list (justify every entry) ---
+# module_name_repetitions: common in idiomatic Rust (e.g. error::Error).
+module_name_repetitions = "allow"
+# multiple_crate_versions: transitive dependency version conflicts are not actionable.
+multiple_crate_versions = "allow"
+# wildcard_imports: deny everywhere; selectively #[allow] in test modules.
+wildcard_imports = "deny"

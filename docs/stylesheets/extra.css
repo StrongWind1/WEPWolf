@@ -1,0 +1,18 @@
+/* Custom primary palette -- slate base to match the "wolf" suite, amber accent. */
+:root {
+  --md-primary-fg-color: #2b3440;
+  --md-primary-fg-color--light: #3b4654;
+  --md-primary-fg-color--dark: #1a2029;
+  /* Material derives the link colour from the primary colour, but our primary is
+     a near-black slate, which renders links almost invisible. Set an explicit,
+     accessible link colour: a clear blue in light mode, a bright blue in dark. */
+  --md-typeset-a-color: #1565c0;
+}
+
+[data-md-color-scheme="slate"] {
+  --md-primary-fg-color: #1a2029;
+  --md-primary-fg-color--light: #2b3440;
+  --md-primary-fg-color--dark: #12161d;
+  /* Links on the dark slate background need a light, high-contrast blue. */
+  --md-typeset-a-color: #6cb6ff;
+}

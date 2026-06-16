@@ -1,0 +1,15 @@
+# Python tooling for the documentation site only. WEPWolf itself is a Rust crate
+# (see Cargo.toml); this file exists solely so the MkDocs docs build with the
+# project's standard `uv run --group docs mkdocs build --strict` invocation, the
+# same convention the sibling tools use. It defines no Python package.
+[project]
+name = "wepwolf-docs"
+version = "0.0.0"
+description = "Documentation build environment for WEPWolf (the tool is Rust; see Cargo.toml)."
+requires-python = ">=3.11"
+
+[dependency-groups]
+docs = ["mkdocs", "mkdocs-material"]
+
+[tool.uv]
+package = false

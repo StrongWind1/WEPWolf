@@ -1,0 +1,26 @@
+version: 2
+updates:
+  # Rust crates: one weekly pull request carrying every available update -- major,
+  # minor, and patch, for every dependency -- so the lockfile stays current with
+  # the fewest PRs. The project's policy is always-latest: fix the code if a bump
+  # breaks, not the reverse.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    groups:
+      all-dependencies:
+        patterns: ["*"]
+        update-types: [major, minor, patch]
+
+  # GitHub Actions: likewise collapsed into a single weekly PR.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    groups:
+      all-actions:
+        patterns: ["*"]
+        update-types: [major, minor, patch]
