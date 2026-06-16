@@ -203,61 +203,82 @@ fn scan_file(
             spinner.set_message(format!("scanning: {} file(s), {total} packets", files_done.load(Ordering::Relaxed)));
         }
 
-        let Some(dlt) = reader.link_type(packet.interface_id) else {
+        // Classify the packet, then hand its data buffer back to the reader so the
+        // next read reuses the allocation instead of allocating afresh (FR-IN-5;
+        // the recycle contract the pcap/pcapng readers implement). `process_packet`
+        // returns on every skip, so the recycle below runs for every packet.
+        if let Some(dlt) = reader.link_type(packet.interface_id) {
+            process_packet(&packet, dlt, bssids, challenges, stats, log_active, events, carve);
+        } else {
             stats.packets_unknown_link += 1;
             if log_active {
                 events.push(LogEvent::UnknownLink(packet.interface_id));
             }
-            continue;
-        };
-
-        let Some(frame_bytes) = strip_and_resolve(&packet, dlt, stats, log_active, events) else {
-            continue; // link_errors already counted
-        };
-
-        match frame::parse(frame_bytes) {
-            ParseResult::Control => stats.ctrl_frames += 1,
-            ParseResult::Malformed(reason) => {
-                stats.malformed_mac += 1;
-                if log_active {
-                    events.push(LogEvent::Malformed(reason.to_owned()));
-                }
-            },
-            ParseResult::Frame(hdr) | ParseResult::Lenient(hdr) => {
-                if hdr.frame_type == TYPE_MANAGEMENT {
-                    stats.mgmt_frames += 1;
-                } else if hdr.frame_type == TYPE_DATA {
-                    stats.data_frames += 1;
-                } else {
-                    stats.extension_frames += 1;
-                    continue; // type 3: not body-classified
-                }
-                let Some(body) = frame_bytes.get(hdr.body_offset..) else {
-                    stats.truncated += 1;
-                    continue;
-                };
-                let kind = classify::observe(bssids, challenges, &hdr, body);
-                // Carve (FR-OUT-6): write WEP crack frames now; buffer beacons for
-                // the BSSID, written later only if it classifies WEP. The writer is
-                // shared across workers, so lock only when there is a frame to
-                // write (never on the Skip path) and recover a poisoned lock so one
-                // worker's panic cannot drop another's frames.
-                if let Some(carver) = carve {
-                    match kind {
-                        Carve::Wep => {
-                            carver.lock().unwrap_or_else(std::sync::PoisonError::into_inner).wep_frame(frame_bytes);
-                        },
-                        Carve::Beacon => {
-                            carver
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .beacon(hdr.ap, frame_bytes);
-                        },
-                        Carve::Skip => {},
-                    }
-                }
-            },
         }
+        reader.recycle_buffer(packet.data);
+    }
+}
+
+/// Classify one packet's frame: strip the link header + FCS, parse the MAC header,
+/// and (for data/management frames) hand the body to the classifier and the carver.
+///
+/// Each skip path is a `return` rather than a loop `continue`, so [`scan_file`] can
+/// unconditionally recycle the packet's data buffer after this returns (the buffer
+/// is borrowed only for the duration of this call -- the classifier and carver copy
+/// out what they keep).
+fn process_packet(
+    packet: &Packet,
+    dlt: u16,
+    bssids: &mut BTreeMap<Mac, BssidWep>,
+    challenges: &mut ChallengeCache,
+    stats: &mut Stats,
+    log_active: bool,
+    events: &mut Vec<LogEvent>,
+    carve: Option<&Mutex<&mut Carver>>,
+) {
+    let Some(frame_bytes) = strip_and_resolve(packet, dlt, stats, log_active, events) else {
+        return; // link_errors already counted
+    };
+
+    match frame::parse(frame_bytes) {
+        ParseResult::Control => stats.ctrl_frames += 1,
+        ParseResult::Malformed(reason) => {
+            stats.malformed_mac += 1;
+            if log_active {
+                events.push(LogEvent::Malformed(reason.to_owned()));
+            }
+        },
+        ParseResult::Frame(hdr) | ParseResult::Lenient(hdr) => {
+            if hdr.frame_type == TYPE_MANAGEMENT {
+                stats.mgmt_frames += 1;
+            } else if hdr.frame_type == TYPE_DATA {
+                stats.data_frames += 1;
+            } else {
+                stats.extension_frames += 1;
+                return; // type 3: not body-classified
+            }
+            let Some(body) = frame_bytes.get(hdr.body_offset..) else {
+                stats.truncated += 1;
+                return;
+            };
+            let kind = classify::observe(bssids, challenges, &hdr, body);
+            // Carve (FR-OUT-6): write WEP crack frames now; buffer beacons for the
+            // BSSID, written later only if it classifies WEP. The writer is shared
+            // across workers, so lock only when there is a frame to write (never on
+            // the Skip path) and recover a poisoned lock so one worker's panic
+            // cannot drop another's frames.
+            if let Some(carver) = carve {
+                match kind {
+                    Carve::Wep => {
+                        carver.lock().unwrap_or_else(std::sync::PoisonError::into_inner).wep_frame(frame_bytes);
+                    },
+                    Carve::Beacon => {
+                        carver.lock().unwrap_or_else(std::sync::PoisonError::into_inner).beacon(hdr.ap, frame_bytes);
+                    },
+                    Carve::Skip => {},
+                }
+            }
+        },
     }
 }
 
