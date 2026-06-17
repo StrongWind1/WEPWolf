@@ -14,13 +14,6 @@ use crate::model::{BssidWep, Encryption, KeyLen, Mac, WepKey};
 use crate::progress::Progress;
 use crate::wep::Verifier;
 
-/// Default per-BSSID wall-clock budget for the sweep when `--time-budget` is
-/// unset. A clean crack lands in well under a second; this only bounds the
-/// hopeless-but-not-thin BSSIDs whose backtracking would otherwise spin -- 30s
-/// gives the deeper adaptive search room to land a marginal capture before the
-/// deadline cuts it off.
-const DEFAULT_SWEEP_BUDGET: Duration = Duration::from_secs(30);
-
 /// A recovered key plus the provenance the reporter needs.
 #[derive(Debug, Clone)]
 pub struct CrackResult {
@@ -231,9 +224,9 @@ pub fn crack_all(
     }
 
     // Phase 1: sweep -- each still-uncracked BSSID's cheap attacks run on the
-    // pool, each bounded by a per-BSSID wall-clock deadline so a hard network
-    // cannot starve the rest (FR-PERF-3). `--time-budget` overrides the default.
-    let sweep_budget = budget.unwrap_or(DEFAULT_SWEEP_BUDGET);
+    // pool, bounded by the per-BSSID `budget` (already resolved upstream: the
+    // default, an explicit `--time-budget`, or `None` for unlimited) so a hard
+    // network cannot starve the rest (FR-PERF-3).
     let swept: Vec<CrackResult> = wep
         .par_iter()
         .filter(|b| !cracked.contains(&b.bssid))
@@ -243,7 +236,7 @@ pub fn crack_all(
             // Crack each WEP key slot separately (FR-ATK-SLOT-1); crack() splits the
             // per-BSSID budget into a fair slice per attack (FR-PERF-3).
             let started = Instant::now();
-            let mut found = crack_slots(b, attacks, lengths, Some(sweep_budget));
+            let mut found = crack_slots(b, attacks, lengths, budget);
             // Stamp every slot with the time actually spent cracking this BSSID
             // (FR-OUT-2 `seconds`) -- per-BSSID granularity under the parallel sweep,
             // not phase-relative, so a fast crack reads fast even when it lands late.

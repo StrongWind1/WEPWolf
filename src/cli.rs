@@ -95,7 +95,8 @@ pub struct Cli {
     ///
     /// A last-resort exhaustive sweep of the full 40-bit keyspace, run only on
     /// networks every statistical and wordlist attack left uncracked. Off by
-    /// default; pair it with --time-budget to bound the grind.
+    /// default; bounded by --time-budget (1 minute per BSSID unless raised, or 0
+    /// for unlimited).
     #[arg(long, help_heading = "Targeting & attacks", display_order = 4)]
     pub brute: bool,
 
@@ -138,11 +139,10 @@ pub struct Cli {
     #[arg(short = 'j', long, value_name = "N", help_heading = "Performance", display_order = 20)]
     pub threads: Option<usize>,
 
-    /// Per-BSSID time budget in seconds for the sweep and brute.
+    /// Per-BSSID time budget in seconds for the sweep and brute (default 60).
     ///
     /// Caps the wall-clock each network may spend in the statistical sweep and
-    /// the optional brute force. Unset: a 30-second sweep per BSSID and an
-    /// unbounded brute. 0 means unlimited.
+    /// the brute force alike. Unset: 1 minute per BSSID. 0 means unlimited.
     #[arg(long, value_name = "SECS", help_heading = "Performance", display_order = 21)]
     pub time_budget: Option<u64>,
 
@@ -275,8 +275,9 @@ fn run_inner(cli: &Cli) -> Result<ExitCode> {
         None => KeyLen::all().to_vec(),
     };
     let attacks = build_attacks(cli)?;
-    // A zero or unset budget means unlimited; otherwise bound each brute grind.
-    let budget = cli.time_budget.filter(|&s| s > 0).map(std::time::Duration::from_secs);
+    // Resolve --time-budget: unset -> the 1-minute default, 0 -> unlimited, N -> N
+    // seconds. The same per-BSSID cap bounds both the sweep and the brute grind.
+    let budget = resolve_budget(cli.time_budget);
     // A potfile seeds reuse with previously-recovered keys (hashcat-style).
     let seed_keys: Vec<_> = match &cli.potfile {
         Some(path) => potfile::load(path)?.into_iter().map(|(_, key)| key).collect(),
@@ -341,6 +342,23 @@ fn build_attacks(cli: &Cli) -> Result<Vec<Box<dyn Attack>>> {
         attacks.push(Box::new(BruteAttack));
     }
     Ok(attacks)
+}
+
+/// Default per-BSSID time budget when `--time-budget` is unset: 1 minute, applied
+/// to both the statistical sweep and the brute grind. A clean crack lands in well
+/// under a second; this only bounds the hopeless-but-not-thin networks whose
+/// backtracking would otherwise spin.
+const DEFAULT_TIME_BUDGET: std::time::Duration = std::time::Duration::from_mins(1);
+
+/// Resolve `--time-budget` into the per-BSSID deadline shared by the sweep and the
+/// grind (FR-PERF-3): unset -> the 60s default, `0` -> unlimited (`None`), `N` ->
+/// N seconds.
+const fn resolve_budget(time_budget: Option<u64>) -> Option<std::time::Duration> {
+    match time_budget {
+        None => Some(DEFAULT_TIME_BUDGET),
+        Some(0) => None,
+        Some(n) => Some(std::time::Duration::from_secs(n)),
+    }
 }
 
 /// Parse `aa:bb:cc:dd:ee:ff` into a MAC address.
@@ -496,5 +514,15 @@ mod tests {
         record_cracks(&mut stats, &map, &[]); // nothing cracked
         assert_eq!(stats.uncracked_thin, 1, "the 1-IV BSSID is thin");
         assert_eq!(stats.uncracked_infeasible, 1, "the floor-IV BSSID had material but yielded no key");
+    }
+
+    #[test]
+    fn resolve_budget_defaults_to_one_minute_and_zero_is_unlimited() {
+        // FR-PERF-3: --time-budget unset -> the 1-minute default (sweep and brute
+        // alike); 0 -> unlimited (no per-BSSID cap); N -> N seconds.
+        use std::time::Duration;
+        assert_eq!(resolve_budget(None), Some(Duration::from_mins(1)), "unset is the 1-minute default");
+        assert_eq!(resolve_budget(Some(0)), None, "0 is unlimited");
+        assert_eq!(resolve_budget(Some(45)), Some(Duration::from_secs(45)), "N is N seconds");
     }
 }
