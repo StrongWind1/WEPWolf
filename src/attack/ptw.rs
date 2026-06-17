@@ -32,7 +32,7 @@ impl Attack for PtwAttack {
 
     fn run(&self, bssid: &BssidWep, len: KeyLen, verifier: &Verifier) -> Option<WepKey> {
         // Every data frame's SNAP keystream feeds PTW; ARP/IP frames add longer ones.
-        recover(&bssid.ivs, &bssid.arp_keystreams, len.byte_len(), verifier, self.tuning.brute_tail, W_MP)
+        recover(bssid.ivs(), bssid.arp_keystreams(), len.byte_len(), verifier, self.tuning.brute_tail, W_MP)
     }
 }
 
@@ -45,12 +45,14 @@ const W_KLEIN: i32 = 13;
 /// 2010] Eq. 16), so its signal over the floor is ~0.11/N -- about 4/13 of
 /// Klein's, which sets the 13:4 ratio. aircrack-ng's PTW votes Klein only, so
 /// this is the extra per-packet signal that drops the packets-needed below it.
-const W_MP: i32 = 4;
+pub(crate) const W_MP: i32 = 4;
 
 /// Tally the Klein + Maitra-Paul sigma votes, then search the top candidates per
 /// position (differenced into key octets) for the first key the verifier accepts.
 /// The search tries the argmax key first, so a clean signal cracks immediately.
-fn recover(
+/// Shared with [`crate::attack::ska`], which runs the same vote over the pool that
+/// includes the harvested shared-key-auth keystream.
+pub(crate) fn recover(
     primary: &[IvSample],
     secondary: &[IvSample],
     keylen: usize,
@@ -396,7 +398,10 @@ mod tests {
     #[test]
     fn ptw_end_to_end_via_attack() {
         let key = [0xde_u8, 0xad, 0xbe, 0xef, 0x01];
-        let bssid = BssidWep { arp_keystreams: arp_samples(&key, 80_000), ..Default::default() };
+        let bssid = BssidWep::with_material(crate::model::WepMaterial {
+            arp_keystreams: arp_samples(&key, 80_000),
+            ..Default::default()
+        });
         let recovered = PtwAttack::default().run(&bssid, KeyLen::Wep40, &verifier_for(&key));
         assert_eq!(recovered.as_ref().map(WepKey::as_slice), Some(key.as_slice()));
     }

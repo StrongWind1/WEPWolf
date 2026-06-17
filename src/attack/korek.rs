@@ -64,7 +64,7 @@ impl Attack for KorekAttack {
         let ffact = if quick { 1.0 } else { self.tuning.ffact_for(len) };
         let brute_tail = if quick { 1.min(n) } else { self.tuning.brute_tail.min(n) };
         // Tally over distinct IVs only -- reused IVs would bias the votes (C5).
-        let samples = super::unique_samples(&bssid.ivs, &bssid.arp_keystreams);
+        let samples = super::unique_samples(bssid.ivs(), bssid.arp_keystreams());
         let mut secret = vec![0u8; n];
         // The per-BSSID deadline (FR-PERF-3) bounds wall-clock; this only caps the
         // absolute node count, generous enough for the search plus a tail brute.
@@ -282,7 +282,8 @@ mod tests {
     #[test]
     fn korek_recovers_wep40() {
         let key = [0x64u8, 0x33, 0xa1, 0x07, 0xfe];
-        let bssid = BssidWep { ivs: samples(&key, 120_000), ..Default::default() };
+        let bssid =
+            BssidWep::with_material(crate::model::WepMaterial { ivs: samples(&key, 120_000), ..Default::default() });
         let recovered = KorekAttack::default().run(&bssid, KeyLen::Wep40, &verifier_for(&key));
         assert_eq!(recovered.as_ref().map(WepKey::as_slice), Some(key.as_slice()));
     }

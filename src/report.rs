@@ -6,9 +6,9 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::time::Duration;
 
-use crate::attack::{CrackResult, unique_iv_count};
+use crate::attack::{CrackResult, min_samples, unique_iv_count};
 use crate::classify::Encryption;
-use crate::model::{BssidWep, Mac, WepKey};
+use crate::model::{BssidWep, KeyLen, Mac, WepKey};
 use crate::scan::ScanResult;
 use crate::stats::Stats;
 
@@ -127,13 +127,14 @@ fn keys_table(out: &mut String, keys: &[&CrackResult], ivs_of: &impl Fn(Mac) -> 
     let _ = writeln!(out);
 }
 
-/// Maximum WEP BSSID rows shown in the human summary before truncating. The full
-/// list is always in `--plain` / `--json`; dumping every observed BSSID is useless
-/// on an input with hundreds of thousands.
-const WEP_ROWS: usize = 25;
-
 /// The WEP-BSSID summary, most-IVs first, with a per-target `via` (the attack that
 /// cracked it, or `-`) and a one-line census of the non-WEP networks.
+///
+/// Every WEP BSSID at or above the WEP-40 feasibility floor of distinct IVs --
+/// plus any cracked below it (reuse/keygen) -- is listed: those are the actionable
+/// networks. The long tail of thin captures (too few IVs to ever converge) is
+/// collapsed into a single count, so a megacorpus does not print a million
+/// near-empty rows. The full per-BSSID list is always in `--plain` / `--json`.
 fn summary_table(
     out: &mut String,
     result: &ScanResult,
@@ -146,20 +147,27 @@ fn summary_table(
         let _ = writeln!(out, "No WEP BSSIDs observed ({wpa} WPA, {open} open, {unknown} unknown).");
         return;
     }
+    let floor = min_samples(KeyLen::Wep40);
     let _ = writeln!(out, "WEP BSSIDs (most IVs first):");
     let _ = writeln!(out, "{:<17}  {:>8}  {:<10}  ESSID", "BSSID", "IVS", "VIA");
-    for b in wep.iter().take(WEP_ROWS) {
-        let _ = writeln!(
-            out,
-            "{:<17}  {:>8}  {:<10}  {}",
-            b.bssid,
-            ivs_of(b.bssid),
-            via.get(&b.bssid).copied().unwrap_or("-"),
-            essid_display(b.essid.as_deref())
-        );
+    // `wep` is sorted most-IVs-first; list every network at/above the crack floor
+    // (or already cracked) and count the thin remainder for the collapse line below.
+    let mut listed = 0usize;
+    for b in wep {
+        if ivs_of(b.bssid) >= floor || via.contains_key(&b.bssid) {
+            let _ = writeln!(
+                out,
+                "{:<17}  {:>8}  {:<10}  {}",
+                b.bssid,
+                ivs_of(b.bssid),
+                via.get(&b.bssid).copied().unwrap_or("-"),
+                essid_display(b.essid.as_deref())
+            );
+            listed += 1;
+        }
     }
-    if wep.len() > WEP_ROWS {
-        let _ = writeln!(out, "  ... and {} more WEP BSSIDs with fewer IVs", wep.len() - WEP_ROWS);
+    if wep.len() > listed {
+        let _ = writeln!(out, "  ... and {} more thin WEP BSSIDs (< {floor} IVs, uncracked)", wep.len() - listed);
     }
     let _ =
         writeln!(out, "({} WEP, {wpa} WPA, {open} open, {unknown} unknown BSSIDs observed; --json for all)", wep.len());

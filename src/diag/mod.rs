@@ -7,5 +7,5 @@ pub mod log;
 pub mod mem;
 
 pub use debug::DebugPrinter;
-pub use log::{LogEvent, Logger};
+pub use log::{EventTally, LogEvent, Logger};
 pub use mem::MemMonitor;

@@ -9,6 +9,8 @@ pub mod gzip;
 pub mod pcap;
 pub mod pcapng;
 
+use rayon::iter::{IntoParallelIterator as _, ParallelIterator as _};
+
 use crate::types::Result;
 
 // --- Allocation safety cap ---
@@ -283,12 +285,15 @@ fn has_capture_magic(path: &Path) -> bool {
     is_capture_magic(head)
 }
 
-/// Recursively collects capture files under `dir`, appending them to `out`.
+/// Recursively collects every regular file under `dir`, appending them to `out`.
 ///
-/// Each candidate file's first 4 bytes are read and tested via
-/// `has_capture_magic`; only files whose magic matches a supported capture
-/// format are included. Extensions are never consulted -- a `.bin` named
-/// pcap is picked up, a `.pcap` named JSON is not.
+/// This is the cheap, metadata-only first half of discovery: it reads directory
+/// entries (using `file_type()`, which uses the entry's `d_type` and so opens no
+/// files) and never inspects file contents. The magic-byte filter -- the slow part,
+/// an `open`+`read` per file -- runs afterwards in [`expand_inputs`], in parallel
+/// on the work-stealing pool, instead of serially here. On a megacorpus this turns
+/// a multi-million-file discovery from a long serial stall into a fast walk plus a
+/// parallel filter.
 ///
 /// Symlinks are not followed (avoids cycles and surprise inclusion of files
 /// outside the tree the operator pointed at). Within each directory, files
@@ -296,7 +301,7 @@ fn has_capture_magic(path: &Path) -> bool {
 /// descended -- this gives a deterministic traversal that does not depend
 /// on filesystem iteration order. Entries that cannot be `stat`'d are
 /// reported as warnings on stderr and skipped.
-fn collect_capture_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) -> Result<()> {
+fn collect_candidate_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) -> Result<()> {
     let mut files: Vec<std::path::PathBuf> = Vec::new();
     let mut subdirs: Vec<std::path::PathBuf> = Vec::new();
 
@@ -320,7 +325,7 @@ fn collect_capture_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) -> Resul
         };
         if ft.is_dir() {
             subdirs.push(path);
-        } else if ft.is_file() && has_capture_magic(&path) {
+        } else if ft.is_file() {
             files.push(path);
         }
     }
@@ -329,7 +334,7 @@ fn collect_capture_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) -> Resul
     subdirs.sort();
     out.append(&mut files);
     for sub in subdirs {
-        collect_capture_files(&sub, out)?;
+        collect_candidate_files(&sub, out)?;
     }
     Ok(())
 }
@@ -365,7 +370,16 @@ pub fn expand_inputs(inputs: &[std::path::PathBuf]) -> Result<Vec<std::path::Pat
             },
         };
         if meta.is_dir() {
-            collect_capture_files(path, &mut out)?;
+            // Walk the tree to a candidate list (cheap, metadata-only), then magic-filter
+            // it in parallel: the per-file open+read is the slow part of discovery, so it
+            // runs on the work-stealing pool rather than serially. `into_par_iter().filter()`
+            // over an indexed Vec preserves order, so the result is deterministic and the
+            // sorted files-before-subdirs traversal still holds (FR-IN-6).
+            let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+            collect_candidate_files(path, &mut candidates)?;
+            let captures: Vec<std::path::PathBuf> =
+                candidates.into_par_iter().filter(|p| has_capture_magic(p)).collect();
+            out.extend(captures);
         } else {
             // Regular file (or symlink to one): pass through verbatim. Don't filter by
             // extension -- an explicitly named argument has already been chosen by the

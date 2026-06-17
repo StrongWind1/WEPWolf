@@ -34,9 +34,11 @@ pub struct CrackResult {
     pub attack: &'static str,
     /// The default-key slot (0-3) the key was used in.
     pub key_id: u8,
-    /// Wall-clock from the start of the attack phase to when this key verified
-    /// (FR-OUT-2 `seconds`). Stamped per BSSID for the parallel sweep and per
-    /// brute for the grind; a seeded/reused key is stamped when it is verified.
+    /// Wall-clock spent cracking this BSSID -- from when its attacks started to
+    /// when the key verified (FR-OUT-2 `seconds`), not phase-relative, so a fast
+    /// crack reads as fast even when it lands late in the parallel sweep. Stamped
+    /// per BSSID for the sweep, per brute for the grind, and the verify time for a
+    /// reused or seeded key.
     pub elapsed: Duration,
 }
 
@@ -60,31 +62,54 @@ pub fn crack(
     verifier: &Verifier,
     attacks: &[Box<dyn Attack>],
     lengths: &[KeyLen],
+    budget: Option<Duration>,
 ) -> Option<CrackResult> {
-    // Two passes share the per-BSSID deadline: a quick pass runs only the cheap
-    // argmax/top-k search of every attack across every key length, then a full
-    // pass adds the expensive backtracking ladders. This way the true key
-    // length's cheap crack is reached before a wrong length's heavy search can
-    // burn the budget -- the case that left high-IV WEP-104 captures uncracked
-    // (FR-PERF-3). A clean capture cracks in the quick pass and never pays for the
-    // ladders.
+    // Two passes: a quick pass runs only the cheap argmax/top-k search of every
+    // attack across every key length, then a full pass adds the expensive
+    // backtracking ladders. This way the true key length's cheap crack is reached
+    // before a wrong length's heavy search can burn the budget -- the case that
+    // left high-IV WEP-104 captures uncracked (FR-PERF-3). A clean capture cracks
+    // in the quick pass and never pays for the ladders.
+    //
+    // Fair shot (FR-PERF-3): the per-BSSID `budget` is split into an equal slice
+    // per statistical attack, set fresh before each one in the full pass, so a slow
+    // earlier attack (PTW's deep ladder) cannot starve the ones after it --
+    // PTW -> KoreK -> FMS -> bias each get their own turn. The quick pass shares
+    // the whole budget because its searches finish near-instantly.
+    //
+    // The divisor counts only the attacks that will actually run on this BSSID
+    // (applicable at some length), so a registered-but-inapplicable attack -- SKA on
+    // a no-handshake network, dict/keygen without --wordlist -- does not shrink the
+    // slices the runnable ones receive.
+    let runnable = u32::try_from(
+        attacks.iter().filter(|a| !a.is_grind() && lengths.iter().any(|&l| a.applicable(bssid, l))).count(),
+    )
+    .unwrap_or(1)
+    .max(1);
+    let slice = budget.map(|b| b / runnable);
     for quick in [true, false] {
         super::set_quick(quick);
         for attack in attacks {
             if attack.is_grind() {
                 continue;
             }
+            // Quick pass shares the full budget (cheap searches); the full pass gives
+            // each attack its own fresh slice so none is starved.
+            let window = if quick { budget } else { slice };
+            super::set_deadline(window.and_then(|w| Instant::now().checked_add(w)));
             for &len in lengths {
                 if attack.applicable(bssid, len)
                     && let Some(key) = attack.run(bssid, len, verifier)
                 {
                     super::set_quick(false);
+                    super::set_deadline(None);
                     return Some(result(bssid, key, attack.name()));
                 }
             }
         }
     }
     super::set_quick(false);
+    super::set_deadline(None);
     None
 }
 
@@ -118,9 +143,11 @@ fn active_slots(mask: u8) -> Vec<u8> {
 /// keystream is left intact (it is not slot-specific).
 fn slot_view(bssid: &BssidWep, key_id: u8) -> BssidWep {
     let mut view = bssid.clone();
-    view.ivs.retain(|s| s.key_id == key_id);
-    view.arp_keystreams.retain(|s| s.key_id == key_id);
-    view.enc_frames.retain(|f| f.key_id == key_id);
+    if let Some(m) = view.material.as_deref_mut() {
+        m.ivs.retain(|s| s.key_id == key_id);
+        m.arp_keystreams.retain(|s| s.key_id == key_id);
+        m.enc_frames.retain(|f| f.key_id == key_id);
+    }
     view.key_ids_seen = 1 << key_id;
     view
 }
@@ -133,18 +160,26 @@ fn slot_view(bssid: &BssidWep, key_id: u8) -> BssidWep {
 /// one key. The common single-slot capture is attacked as-is; a multi-slot AP is
 /// attacked once per slot from only that slot's samples and verifier frames,
 /// yielding one verified key per recovered slot.
-fn crack_slots(bssid: &BssidWep, attacks: &[Box<dyn Attack>], lengths: &[KeyLen]) -> Vec<CrackResult> {
+fn crack_slots(
+    bssid: &BssidWep,
+    attacks: &[Box<dyn Attack>],
+    lengths: &[KeyLen],
+    budget: Option<Duration>,
+) -> Vec<CrackResult> {
     let slots = active_slots(bssid.key_ids_seen);
     if slots.len() <= 1 {
-        let verifier = Verifier::new(bssid.enc_frames.clone());
-        return crack(bssid, &verifier, attacks, lengths).into_iter().collect();
+        let verifier = Verifier::new(bssid.enc_frames().to_vec());
+        return crack(bssid, &verifier, attacks, lengths, budget).into_iter().collect();
     }
+    // Share the per-BSSID budget across the slots so a multi-slot AP cannot run
+    // longer overall than a single-slot one (FR-PERF-3).
+    let per_slot = budget.map(|b| b / u32::try_from(slots.len()).unwrap_or(1).max(1));
     slots
         .into_iter()
         .filter_map(|slot| {
             let view = slot_view(bssid, slot);
-            let verifier = Verifier::new(view.enc_frames.clone());
-            crack(&view, &verifier, attacks, lengths).map(|mut found| {
+            let verifier = Verifier::new(view.enc_frames().to_vec());
+            crack(&view, &verifier, attacks, lengths, per_slot).map(|mut found| {
                 found.key_id = slot;
                 found
             })
@@ -182,10 +217,11 @@ pub fn crack_all(
     // without attacking it, the way hashcat reuses its pot.
     if !seed_keys.is_empty() {
         for b in &wep {
-            let verifier = Verifier::new(b.enc_frames.clone());
+            let verifier = Verifier::new(b.enc_frames().to_vec());
+            let started = Instant::now();
             if let Some(key) = seed_keys.iter().find(|k| verifier.accept(k)) {
                 let mut c = result(b, *key, "potfile");
-                c.elapsed = phase_start.elapsed();
+                c.elapsed = started.elapsed();
                 sweep.println(&row(&c));
                 sweep.inc(1);
                 cracked.insert(b.bssid);
@@ -202,18 +238,18 @@ pub fn crack_all(
         .par_iter()
         .filter(|b| !cracked.contains(&b.bssid))
         .flat_map_iter(|b| {
-            super::set_deadline(Instant::now().checked_add(sweep_budget));
             // Surface the network being worked, so a slow BSSID is visible (FR-UI-1).
             sweep.set_message(format!("attacking {}", b.bssid));
-            // Crack each WEP key slot separately (FR-ATK-SLOT-1); the per-BSSID
-            // deadline is shared across the slots so a multi-slot AP cannot run long.
-            let mut found = crack_slots(b, attacks, lengths);
-            super::set_deadline(None);
-            // Stamp every slot of this BSSID with the moment it finished -- per-BSSID
-            // granularity is the meaningful crack time under the parallel sweep.
-            let t = phase_start.elapsed();
+            // Crack each WEP key slot separately (FR-ATK-SLOT-1); crack() splits the
+            // per-BSSID budget into a fair slice per attack (FR-PERF-3).
+            let started = Instant::now();
+            let mut found = crack_slots(b, attacks, lengths, Some(sweep_budget));
+            // Stamp every slot with the time actually spent cracking this BSSID
+            // (FR-OUT-2 `seconds`) -- per-BSSID granularity under the parallel sweep,
+            // not phase-relative, so a fast crack reads fast even when it lands late.
+            let took = started.elapsed();
             for c in &mut found {
-                c.elapsed = t;
+                c.elapsed = took;
                 sweep.println(&row(c));
             }
             sweep.inc(1);
@@ -232,10 +268,11 @@ pub fn crack_all(
         if cracked.contains(&b.bssid) {
             continue;
         }
-        let verifier = Verifier::new(b.enc_frames.clone());
+        let verifier = Verifier::new(b.enc_frames().to_vec());
+        let started = Instant::now();
         if let Some(key) = found.iter().find(|k| verifier.accept(k)) {
             let mut c = result(b, *key, "reuse");
-            c.elapsed = phase_start.elapsed();
+            c.elapsed = started.elapsed();
             sweep.println(&row(&c));
             cracked.insert(b.bssid);
             cracks.push(c);
@@ -248,13 +285,14 @@ pub fn crack_all(
     let grind_start = Instant::now();
     if attacks.iter().any(|a| a.is_grind()) && lengths.contains(&KeyLen::Wep40) {
         for b in &wep {
-            if cracked.contains(&b.bssid) || b.enc_frames.is_empty() {
+            if cracked.contains(&b.bssid) || b.enc_frames().is_empty() {
                 continue;
             }
-            let verifier = Verifier::new(b.enc_frames.clone());
+            let verifier = Verifier::new(b.enc_frames().to_vec());
+            let started = Instant::now();
             if let Some(key) = grind(b.bssid, &verifier, budget, progress) {
                 let mut c = result(b, key, "brute");
-                c.elapsed = phase_start.elapsed();
+                c.elapsed = started.elapsed();
                 sweep.println(&row(&c));
                 cracked.insert(b.bssid);
                 cracks.push(c);
@@ -315,6 +353,7 @@ fn grind(bssid: Mac, verifier: &Verifier, budget: Option<Duration>, progress: &P
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use super::{Attack, crack};
     use crate::model::{BssidWep, KeyLen, WepKey};
@@ -349,7 +388,8 @@ mod tests {
         // the quick pass (true) must precede the full pass (false).
         let seen = Arc::new(Mutex::new(Vec::new()));
         let attacks: [Box<dyn Attack>; 1] = [Box::new(Recorder { seen: Arc::clone(&seen), crack_when_full: false })];
-        let result = crack(&BssidWep::default(), &Verifier::default(), &attacks, &[KeyLen::Wep40, KeyLen::Wep104]);
+        let result =
+            crack(&BssidWep::default(), &Verifier::default(), &attacks, &[KeyLen::Wep40, KeyLen::Wep104], None);
         assert!(result.is_none());
         // Quick pass over both lengths, then full pass over both lengths.
         assert_eq!(*seen.lock().expect("lock"), vec![true, true, false, false]);
@@ -361,7 +401,55 @@ mod tests {
         // it, proving the full pass runs after the quick pass yields nothing.
         let seen = Arc::new(Mutex::new(Vec::new()));
         let attacks: [Box<dyn Attack>; 1] = [Box::new(Recorder { seen, crack_when_full: true })];
-        let result = crack(&BssidWep::default(), &Verifier::default(), &attacks, &[KeyLen::Wep40]);
+        let result = crack(&BssidWep::default(), &Verifier::default(), &attacks, &[KeyLen::Wep40], None);
         assert!(result.is_some(), "the full pass must run after the quick pass");
+    }
+
+    /// Records the per-attack deadline state observed at the start of each `run`.
+    struct Probe {
+        passed: Arc<Mutex<Vec<bool>>>,
+    }
+
+    impl Attack for Probe {
+        fn name(&self) -> &'static str {
+            "probe"
+        }
+        fn applicable(&self, _bssid: &BssidWep, _len: KeyLen) -> bool {
+            true
+        }
+        fn run(&self, _bssid: &BssidWep, _len: KeyLen, _verifier: &Verifier) -> Option<WepKey> {
+            self.passed.lock().expect("lock").push(crate::attack::deadline_passed());
+            None
+        }
+    }
+
+    #[test]
+    fn crack_arms_a_per_attack_deadline_from_the_budget() {
+        // FR-PERF-3 (fair shot): crack() arms a per-attack deadline derived from the
+        // per-BSSID budget and reset before each attack, so each statistical attack
+        // runs against its own clock rather than a single shared deadline an earlier
+        // attack could have exhausted. A generous budget arms a live window; a
+        // near-zero one arms an already-expired window. (Deterministic: no sleeps.)
+        let live = Arc::new(Mutex::new(Vec::new()));
+        let attacks: [Box<dyn Attack>; 1] = [Box::new(Probe { passed: Arc::clone(&live) })];
+        let _ = crack(
+            &BssidWep::default(),
+            &Verifier::default(),
+            &attacks,
+            &[KeyLen::Wep40],
+            Some(Duration::from_secs(30)),
+        );
+        assert!(live.lock().expect("lock").iter().all(|&p| !p), "a generous budget arms a live per-attack deadline");
+
+        let expired = Arc::new(Mutex::new(Vec::new()));
+        let attacks: [Box<dyn Attack>; 1] = [Box::new(Probe { passed: Arc::clone(&expired) })];
+        let _ = crack(
+            &BssidWep::default(),
+            &Verifier::default(),
+            &attacks,
+            &[KeyLen::Wep40],
+            Some(Duration::from_nanos(1)),
+        );
+        assert!(expired.lock().expect("lock").iter().all(|&p| p), "a near-zero budget arms an already-expired window");
     }
 }

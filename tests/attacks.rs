@@ -17,7 +17,7 @@ use wepwolf::attack::bias::BiasAttack;
 use wepwolf::attack::fms::FmsAttack;
 use wepwolf::attack::ptw::PtwAttack;
 use wepwolf::crypto::{Rc4, crc32};
-use wepwolf::model::{BssidWep, EncFrame, IvSample, KeyLen, WepKey};
+use wepwolf::model::{BssidWep, EncFrame, IvSample, KeyLen, WepKey, WepMaterial};
 use wepwolf::wep::Verifier;
 
 /// Two frames the Verifier can confirm a candidate against.
@@ -51,7 +51,7 @@ fn ptw_recovers_wep40_key() {
     // FR-ATK-PTW-1: PTW cracks a WEP-40 key from ordinary (ARP-length) traffic.
     let key = [0x2bu8, 0x7e, 0x15, 0x16, 0x28];
     let arp = (0..80_000u32).map(|c| keystream([c as u8, (c >> 8) as u8, (c >> 16) as u8], &key, 16)).collect();
-    let bssid = BssidWep { arp_keystreams: arp, ..Default::default() };
+    let bssid = BssidWep::with_material(WepMaterial { arp_keystreams: arp, ..Default::default() });
     let recovered = PtwAttack::default().run(&bssid, KeyLen::Wep40, &verifier_for(&key));
     assert_eq!(recovered.as_ref().map(WepKey::as_slice), Some(key.as_slice()));
 }
@@ -61,7 +61,7 @@ fn bias_recovers_wep40_key() {
     // FR-ATK-1: the Klein RC4-bias attack recovers a WEP-40 key from ordinary traffic.
     let key = [0x9fu8, 0x42, 0x0d, 0xb1, 0x77];
     let arp = (0..80_000u32).map(|c| keystream([c as u8, (c >> 8) as u8, (c >> 16) as u8], &key, 16)).collect();
-    let bssid = BssidWep { arp_keystreams: arp, ..Default::default() };
+    let bssid = BssidWep::with_material(WepMaterial { arp_keystreams: arp, ..Default::default() });
     let recovered = BiasAttack::default().run(&bssid, KeyLen::Wep40, &verifier_for(&key));
     assert_eq!(recovered.as_ref().map(WepKey::as_slice), Some(key.as_slice()));
 }
@@ -92,13 +92,15 @@ fn cross_bssid_key_reuse() {
     let arp = (0..80_000u32).map(|c| keystream([c as u8, (c >> 8) as u8, (c >> 16) as u8], &key, 16)).collect();
     let a = BssidWep {
         bssid: Mac::from_bytes([0x0a; 6]),
-        arp_keystreams: arp,
-        enc_frames: enc.clone(),
         saw_wep_data: true,
-        ..Default::default()
+        ..BssidWep::with_material(WepMaterial { arp_keystreams: arp, enc_frames: enc.clone(), ..Default::default() })
     };
     // B: same key, only verifier frames -- no samples to attack, so it relies on reuse.
-    let b = BssidWep { bssid: Mac::from_bytes([0x0b; 6]), enc_frames: enc, saw_wep_data: true, ..Default::default() };
+    let b = BssidWep {
+        bssid: Mac::from_bytes([0x0b; 6]),
+        saw_wep_data: true,
+        ..BssidWep::with_material(WepMaterial { enc_frames: enc, ..Default::default() })
+    };
 
     let mut map = BTreeMap::new();
     map.insert(a.bssid, a);
@@ -109,6 +111,60 @@ fn cross_bssid_key_reuse() {
         attack::crack_all(&map, &attacks, &[KeyLen::Wep40], None, &[], &wepwolf::progress::Progress::new(false)).cracks;
     assert_eq!(cracks.len(), 2, "both BSSIDs end up cracked");
     assert!(cracks.iter().any(|c| c.attack == "reuse"), "the thin BSSID is cracked via reuse");
+}
+
+#[test]
+fn ska_handshake_network_is_credited_to_ska() {
+    // FR-ATK-SKA-1: a network where a shared-key handshake was captured is cracked
+    // via the SKA bootstrap (the handshake keystream seeds the shared sigma search)
+    // and attributed to "ska", not "ptw" -- so keys_by_ska is meaningful. The same
+    // traffic without a handshake falls straight through to PTW.
+    use std::collections::{BTreeMap, HashMap};
+    use wepwolf::attack::{self, ska::SkaAttack};
+    use wepwolf::model::Mac;
+
+    let key = [0x2bu8, 0x7e, 0x15, 0x16, 0x28];
+    let enc: Vec<EncFrame> = [[9u8, 9, 9], [8, 8, 8]]
+        .iter()
+        .map(|iv| {
+            let plain = b"\xaa\xaa\x03\x00\x00\x00 ska attribution frame";
+            let mut data = plain.to_vec();
+            data.extend_from_slice(&crc32(plain).to_le_bytes());
+            let mut seed = iv.to_vec();
+            seed.extend_from_slice(&key);
+            Rc4::new(&seed).apply_keystream(&mut data);
+            EncFrame { iv: *iv, data, key_id: 0 }
+        })
+        .collect();
+    let arp: Vec<IvSample> =
+        (0..80_000u32).map(|c| keystream([c as u8, (c >> 8) as u8, (c >> 16) as u8], &key, 16)).collect();
+
+    // Same traffic on both; only the first carries a captured handshake.
+    let with_ska = BssidWep {
+        bssid: Mac::from_bytes([0x0e; 6]),
+        saw_wep_data: true,
+        ..BssidWep::with_material(WepMaterial {
+            arp_keystreams: arp.clone(),
+            enc_frames: enc.clone(),
+            ska_keystream: Some(vec![0u8; 40]),
+            ..Default::default()
+        })
+    };
+    let no_ska = BssidWep {
+        bssid: Mac::from_bytes([0x0f; 6]),
+        saw_wep_data: true,
+        ..BssidWep::with_material(WepMaterial { arp_keystreams: arp, enc_frames: enc, ..Default::default() })
+    };
+
+    let mut map = BTreeMap::new();
+    map.insert(with_ska.bssid, with_ska);
+    map.insert(no_ska.bssid, no_ska);
+    let attacks: Vec<Box<dyn Attack>> = vec![Box::new(SkaAttack::default()), Box::new(PtwAttack::default())];
+    let cracks =
+        attack::crack_all(&map, &attacks, &[KeyLen::Wep40], None, &[], &wepwolf::progress::Progress::new(false)).cracks;
+    let via: HashMap<Mac, &str> = cracks.iter().map(|c| (c.bssid, c.attack)).collect();
+    assert_eq!(via.get(&Mac::from_bytes([0x0e; 6])).copied(), Some("ska"), "handshake network is credited to SKA");
+    assert_eq!(via.get(&Mac::from_bytes([0x0f; 6])).copied(), Some("ptw"), "no-handshake network falls through to PTW");
 }
 
 #[test]
@@ -144,7 +200,11 @@ fn time_budget_bounds_the_grind() {
             EncFrame { iv: *iv, data, key_id: 0 }
         })
         .collect();
-    let b = BssidWep { bssid: Mac::from_bytes([0x0c; 6]), enc_frames: enc, saw_wep_data: true, ..Default::default() };
+    let b = BssidWep {
+        bssid: Mac::from_bytes([0x0c; 6]),
+        saw_wep_data: true,
+        ..BssidWep::with_material(WepMaterial { enc_frames: enc, ..Default::default() })
+    };
     let mut map = BTreeMap::new();
     map.insert(b.bssid, b);
     let attacks: Vec<Box<dyn Attack>> = vec![Box::new(BruteAttack)];
@@ -167,7 +227,7 @@ fn fms_recovers_wep40_key() {
             ivs.push(keystream([3 + b, 0xFF, x as u8], &key, 1));
         }
     }
-    let bssid = BssidWep { ivs, ..Default::default() };
+    let bssid = BssidWep::with_material(WepMaterial { ivs, ..Default::default() });
     let recovered = FmsAttack.run(&bssid, KeyLen::Wep40, &verifier_for(&key));
     assert_eq!(recovered.as_ref().map(WepKey::as_slice), Some(key.as_slice()));
 }
@@ -227,11 +287,9 @@ fn cracks_each_key_slot_independently() {
     }
     let b = BssidWep {
         bssid: Mac::from_bytes([0x0d; 6]),
-        arp_keystreams: arp,
-        enc_frames: enc,
         key_ids_seen: 0b11,
         saw_wep_data: true,
-        ..Default::default()
+        ..BssidWep::with_material(WepMaterial { arp_keystreams: arp, enc_frames: enc, ..Default::default() })
     };
     let mut map = BTreeMap::new();
     map.insert(b.bssid, b);
@@ -251,14 +309,16 @@ fn feasibility_gates_on_unique_ivs_not_raw_frames() {
     // so attacking it only burns the per-BSSID budget.
     let count = 1500u32; // above min_samples(Wep40) = 1000
     // Many frames, one IV: too little unique material -> attack not applicable.
-    let replayed =
-        BssidWep { ivs: (0..count).map(|_| IvSample::new([1, 2, 3], &[0u8; 8])).collect(), ..Default::default() };
+    let replayed = BssidWep::with_material(WepMaterial {
+        ivs: (0..count).map(|_| IvSample::new([1, 2, 3], &[0u8; 8])).collect(),
+        ..Default::default()
+    });
     assert!(!PtwAttack::default().applicable(&replayed, KeyLen::Wep40), "one IV replayed many times is not feasible");
     // Same frame count, distinct IVs: feasible.
-    let varied = BssidWep {
+    let varied = BssidWep::with_material(WepMaterial {
         ivs: (0..count).map(|c| IvSample::new([c as u8, (c >> 8) as u8, 0], &[0u8; 8])).collect(),
         ..Default::default()
-    };
+    });
     assert!(PtwAttack::default().applicable(&varied, KeyLen::Wep40), "enough distinct IVs is feasible");
 }
 

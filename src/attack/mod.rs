@@ -58,6 +58,7 @@ pub mod fms;
 pub mod keygen;
 pub mod korek;
 pub mod ptw;
+pub mod ska;
 
 pub use engine::{CrackOutcome, CrackResult, crack, crack_all};
 
@@ -87,8 +88,8 @@ pub const fn min_samples(len: KeyLen) -> usize {
 /// converge. Counting distinct IVs matches how aircrack-ng decides "enough IVs"
 /// and how the votes actually accumulate.
 pub(crate) fn unique_iv_count(bssid: &BssidWep) -> usize {
-    let mut seen: std::collections::HashSet<[u8; 3]> = std::collections::HashSet::with_capacity(bssid.ivs.len());
-    for sample in bssid.ivs.iter().chain(&bssid.arp_keystreams) {
+    let mut seen: std::collections::HashSet<[u8; 3]> = std::collections::HashSet::with_capacity(bssid.ivs().len());
+    for sample in bssid.ivs().iter().chain(bssid.arp_keystreams()) {
         seen.insert(sample.iv);
     }
     seen.len()

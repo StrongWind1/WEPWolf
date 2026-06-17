@@ -30,7 +30,7 @@ use wepwolf::attack::brute::{CpuBrute, SimdBrute};
 use wepwolf::attack::ptw::PtwAttack;
 use wepwolf::attack::{BruteBackend, KeyRange};
 use wepwolf::crypto::{Rc4, crc32};
-use wepwolf::model::{BssidWep, EncFrame, IvSample, KeyLen, WepKey};
+use wepwolf::model::{BssidWep, EncFrame, IvSample, KeyLen, WepKey, WepMaterial};
 use wepwolf::simd::{self, SimdTier};
 use wepwolf::wep::Verifier;
 
@@ -54,7 +54,7 @@ fn bench_ptw() {
             IvSample::new(iv, &ks)
         })
         .collect();
-    let bssid = BssidWep { arp_keystreams: arp, ..Default::default() };
+    let bssid = BssidWep::with_material(WepMaterial { arp_keystreams: arp, ..Default::default() });
     let verifier = verifier_for(&key);
 
     let start = Instant::now();

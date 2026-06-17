@@ -35,7 +35,7 @@ impl Attack for FmsAttack {
     }
 
     fn run(&self, bssid: &BssidWep, len: KeyLen, verifier: &Verifier) -> Option<WepKey> {
-        let secret = recover(&bssid.ivs, len.byte_len());
+        let secret = recover(bssid.ivs(), len.byte_len());
         let key = WepKey::new(&secret)?;
         verifier.accept(&key).then_some(key)
     }
@@ -128,7 +128,8 @@ mod tests {
     #[test]
     fn fms_end_to_end_via_attack() {
         let key = [0xa1u8, 0xb2, 0xc3, 0xd4, 0xe5];
-        let bssid = BssidWep { ivs: weak_ivs(&key, 256), ..Default::default() };
+        let bssid =
+            BssidWep::with_material(crate::model::WepMaterial { ivs: weak_ivs(&key, 256), ..Default::default() });
         let recovered = FmsAttack.run(&bssid, KeyLen::Wep40, &verifier_for(&key));
         assert_eq!(recovered.as_ref().map(WepKey::as_slice), Some(key.as_slice()));
     }

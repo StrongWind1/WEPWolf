@@ -207,15 +207,14 @@ pub enum Encryption {
     Unknown,
 }
 
-/// Everything `WEPWolf` has gathered for one WEP BSSID.
+/// The heavy per-BSSID attack material, boxed inside [`BssidWep`].
 ///
-/// The attack material, the classification evidence, and the frame counts. Populated by the scan/harvest stage (`crate::classify`); consumed by the attack engine.
+/// A non-WEP BSSID -- which never harvests any -- pays a single null pointer
+/// instead of four empty collections. On a real corpus the BSSID map is
+/// overwhelmingly non-WEP (WPA/open/unknown), so keeping those records lean is
+/// what bounds the ingest-time peak memory (FR-IN-5).
 #[derive(Debug, Clone, Default)]
-pub struct BssidWep {
-    /// The access point's BSSID.
-    pub bssid: Mac,
-    /// The advertised ESSID, if a beacon/probe carried it.
-    pub essid: Option<Vec<u8>>,
+pub struct WepMaterial {
     /// IV + short-keystream samples for FMS / `KoreK` / bias.
     pub ivs: Vec<IvSample>,
     /// IV + long-keystream samples from known plaintext -- ARP's fixed header or
@@ -225,6 +224,26 @@ pub struct BssidWep {
     pub ska_keystream: Option<Vec<u8>>,
     /// A few full WEP frames retained for the `Verifier` (the accept path).
     pub enc_frames: Vec<EncFrame>,
+}
+
+/// Everything `WEPWolf` has gathered for one BSSID.
+///
+/// The classification evidence and frame counts are always present; the heavy WEP
+/// attack material is boxed in [`WepMaterial`] and allocated lazily on the first
+/// WEP frame, so the WPA/open/unknown majority keep `material == None` and stay
+/// small. Populated by the scan/harvest stage (`crate::classify`); consumed by the
+/// attack engine. Read the material through [`BssidWep::ivs`] /
+/// [`BssidWep::arp_keystreams`] / [`BssidWep::enc_frames`] /
+/// [`BssidWep::ska_keystream`]; mutate it through [`BssidWep::material_mut`].
+#[derive(Debug, Clone, Default)]
+pub struct BssidWep {
+    /// The access point's BSSID.
+    pub bssid: Mac,
+    /// The advertised ESSID, if a beacon/probe carried it.
+    pub essid: Option<Vec<u8>>,
+    /// Harvested WEP attack material, allocated on the first WEP frame; `None` for
+    /// a BSSID that never showed WEP traffic, so non-WEP records stay small.
+    pub material: Option<Box<WepMaterial>>,
     /// Bitmask of WEP Key IDs (0..3) observed in this BSSID's traffic.
     pub key_ids_seen: u8,
     /// Count of WEP-encrypted data frames seen.
@@ -250,6 +269,43 @@ impl BssidWep {
     /// the rare corrupt frame).
     const MAX_ENC_FRAMES: usize = 8;
 
+    /// The IV/short-keystream samples (empty when no WEP material was harvested).
+    #[must_use]
+    pub fn ivs(&self) -> &[IvSample] {
+        self.material.as_deref().map_or(&[], |m| m.ivs.as_slice())
+    }
+
+    /// The long-keystream (ARP/IPv4/IPv6/SKA) samples for PTW (empty when none).
+    #[must_use]
+    pub fn arp_keystreams(&self) -> &[IvSample] {
+        self.material.as_deref().map_or(&[], |m| m.arp_keystreams.as_slice())
+    }
+
+    /// The full frames retained for the `Verifier` accept path (empty when none).
+    #[must_use]
+    pub fn enc_frames(&self) -> &[EncFrame] {
+        self.material.as_deref().map_or(&[], |m| m.enc_frames.as_slice())
+    }
+
+    /// The recovered Shared-Key-auth keystream, if one was captured.
+    #[must_use]
+    pub fn ska_keystream(&self) -> Option<&[u8]> {
+        self.material.as_deref().and_then(|m| m.ska_keystream.as_deref())
+    }
+
+    /// Mutable access to the attack material, allocating the box on first use.
+    /// Called only on the WEP harvest path, so non-WEP records never allocate it.
+    pub fn material_mut(&mut self) -> &mut WepMaterial {
+        self.material.get_or_insert_with(|| Box::new(WepMaterial::default()))
+    }
+
+    /// Build a record already carrying `material` (a concise constructor for
+    /// utility code and tests; the harvester uses [`BssidWep::material_mut`]).
+    #[must_use]
+    pub fn with_material(material: WepMaterial) -> Self {
+        Self { material: Some(Box::new(material)), ..Default::default() }
+    }
+
     /// Resolve the accumulated evidence to a single classification. WPA evidence
     /// outranks WEP (a WPA beacon also sets the Privacy bit), which outranks open.
     #[must_use]
@@ -271,8 +327,9 @@ impl BssidWep {
     /// slot (FR-ATK-SLOT-1): a per-slot recovered key needs two frames of its own
     /// slot to confirm, and a first-come global cap could fill with one busy slot.
     pub fn retain_enc_frame(&mut self, frame: EncFrame) {
-        if self.enc_frames.iter().filter(|f| f.key_id == frame.key_id).count() < Self::MAX_ENC_FRAMES {
-            self.enc_frames.push(frame);
+        let m = self.material_mut();
+        if m.enc_frames.iter().filter(|f| f.key_id == frame.key_id).count() < Self::MAX_ENC_FRAMES {
+            m.enc_frames.push(frame);
         }
     }
 
@@ -288,13 +345,21 @@ impl BssidWep {
         if self.essid.is_none() {
             self.essid = other.essid;
         }
-        self.ivs.extend(other.ivs);
-        self.arp_keystreams.extend(other.arp_keystreams);
-        if self.ska_keystream.is_none() {
-            self.ska_keystream = other.ska_keystream;
-        }
-        for frame in other.enc_frames {
-            self.retain_enc_frame(frame);
+        // Merge the heavy material only when the other record harvested some, so a
+        // non-WEP merge never allocates a box (keeps the WPA/open majority lean).
+        if let Some(om) = other.material {
+            let m = self.material_mut();
+            m.ivs.extend(om.ivs);
+            m.arp_keystreams.extend(om.arp_keystreams);
+            if m.ska_keystream.is_none() {
+                m.ska_keystream = om.ska_keystream;
+            }
+            for frame in om.enc_frames {
+                // Per-slot cap, mirroring `retain_enc_frame` (inlined to avoid re-borrowing self).
+                if m.enc_frames.iter().filter(|f| f.key_id == frame.key_id).count() < Self::MAX_ENC_FRAMES {
+                    m.enc_frames.push(frame);
+                }
+            }
         }
         self.key_ids_seen |= other.key_ids_seen;
         self.wep_data_frames += other.wep_data_frames;

@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use wepwolf::attack::CrackResult;
-use wepwolf::model::{BssidWep, IvSample, Mac, WepKey};
+use wepwolf::model::{BssidWep, IvSample, Mac, WepKey, WepMaterial};
 use wepwolf::report::{Format, render_string};
 use wepwolf::scan::ScanResult;
 use wepwolf::stats::Stats;
@@ -35,8 +35,10 @@ fn wep_bssid(essid: &[u8]) -> BssidWep {
         essid: Some(essid.to_vec()),
         saw_privacy: true,
         saw_wep_data: true,
-        ivs: (0..7u32).map(|c| IvSample::new([c as u8, 0, 0], &[0u8; 8])).collect(),
-        ..Default::default()
+        ..BssidWep::with_material(WepMaterial {
+            ivs: (0..7u32).map(|c| IvSample::new([c as u8, 0, 0], &[0u8; 8])).collect(),
+            ..Default::default()
+        })
     }
 }
 
@@ -157,6 +159,53 @@ fn non_printable_key_has_no_ascii_per_surface() {
     let key_line = plain.lines().next().unwrap();
     // hex then an empty ASCII field: ...00:01:02:03:04 \t \t 40...
     assert!(key_line.contains("00:01:02:03:04\t\t40"), "empty ascii field for a non-printable key: {key_line}");
+}
+
+#[test]
+fn table_lists_above_floor_and_collapses_thin() {
+    // FR-OUT-1: the human summary lists every WEP BSSID at/above the WEP-40 IV floor
+    // (and any cracked), and collapses the thin long tail into one count -- so a huge
+    // input does not print a million near-empty rows, while every actionable network
+    // stays visible. The full list remains in --plain / --json.
+    let mut bssids = BTreeMap::new();
+    // One rich network (>= 1000 distinct IVs) -> always listed.
+    let rich = Mac::from_bytes([0xAA, 0, 0, 0, 0, 1]);
+    bssids.insert(
+        rich,
+        BssidWep {
+            bssid: rich,
+            essid: Some(b"rich".to_vec()),
+            saw_privacy: true,
+            saw_wep_data: true,
+            ..BssidWep::with_material(WepMaterial {
+                ivs: (0..1500u32).map(|c| IvSample::new([c as u8, (c >> 8) as u8, 0], &[0u8; 8])).collect(),
+                ..Default::default()
+            })
+        },
+    );
+    // Fifty thin networks (one IV each) -> collapsed into a single count line.
+    for i in 0..50u8 {
+        let m = Mac::from_bytes([0xBB, i, 0, 0, 0, 0]);
+        bssids.insert(
+            m,
+            BssidWep {
+                bssid: m,
+                essid: Some(b"thin".to_vec()),
+                saw_privacy: true,
+                saw_wep_data: true,
+                ..BssidWep::with_material(WepMaterial {
+                    ivs: vec![IvSample::new([i, 0, 0], &[0u8; 8])],
+                    ..Default::default()
+                })
+            },
+        );
+    }
+    let result = ScanResult { bssids, stats: Stats { wep_bssids: 51, ..Default::default() } };
+    let out = render_string(&result, &[], Format::Table, false);
+    assert!(out.contains("aa:00:00:00:00:01"), "the rich (>= floor) network is listed: {out}");
+    assert!(out.contains("and 50 more thin WEP BSSIDs"), "the thin tail is collapsed into a count: {out}");
+    // None of the thin BSSIDs (bb:NN:..) is listed individually -- they are collapsed.
+    assert!(!out.contains("bb:00:00:00:00:00"), "thin networks are not listed individually: {out}");
 }
 
 #[test]

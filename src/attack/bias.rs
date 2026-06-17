@@ -417,7 +417,7 @@ impl Attack for BiasAttack {
     fn run(&self, bssid: &BssidWep, len: KeyLen, verifier: &Verifier) -> Option<WepKey> {
         let n = len.byte_len();
         // Distinct IVs only -- a reused IV repeats its votes and biases the table.
-        let samples = super::unique_samples(&bssid.ivs, &bssid.arp_keystreams);
+        let samples = super::unique_samples(bssid.ivs(), bssid.arp_keystreams());
         let mut table = vec![[0i32; 256]; n];
         for sample in &samples {
             accumulate_database_votes(sample.iv, sample.keystream(), &mut table);
@@ -633,7 +633,10 @@ mod tests {
     fn bias_recovers_wep104() {
         // End-to-end: the database recovers a WEP-104 key through the shared search.
         let key = [0x53u8, 0x1a, 0xc7, 0x09, 0xe2, 0x44, 0x8b, 0x10, 0x3d, 0x6f, 0xa1, 0xce, 0x72];
-        let bssid = BssidWep { arp_keystreams: arp_samples(&key, 60_000), ..Default::default() };
+        let bssid = BssidWep::with_material(crate::model::WepMaterial {
+            arp_keystreams: arp_samples(&key, 60_000),
+            ..Default::default()
+        });
         let recovered = BiasAttack::default().run(&bssid, KeyLen::Wep104, &verifier_for(&key));
         assert_eq!(recovered.as_ref().map(WepKey::as_slice), Some(key.as_slice()));
     }
@@ -669,7 +672,8 @@ mod tests {
     #[test]
     fn bias_recovers_wep40() {
         let key = [0x64u8, 0x33, 0xa1, 0x07, 0xfe];
-        let bssid = BssidWep { ivs: arp_samples(&key, 40_000), ..Default::default() };
+        let bssid =
+            BssidWep::with_material(crate::model::WepMaterial { ivs: arp_samples(&key, 40_000), ..Default::default() });
         let recovered = BiasAttack::default().run(&bssid, KeyLen::Wep40, &verifier_for(&key));
         assert_eq!(recovered.as_ref().map(WepKey::as_slice), Some(key.as_slice()));
     }

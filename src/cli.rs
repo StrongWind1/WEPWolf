@@ -16,6 +16,7 @@ use crate::attack::{
     keygen::KeygenAttack,
     korek::KorekAttack,
     ptw::PtwAttack,
+    ska::SkaAttack,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -230,6 +231,7 @@ fn run_inner(cli: &Cli) -> Result<ExitCode> {
         return Err(Error::Io(std::io::Error::other(format!("thread pool: {e}"))));
     }
 
+    debug.say(&format!("discovering capture files under {} path(s)...", cli.paths.len()));
     let inputs = input::expand_inputs(&cli.paths)?;
     if inputs.is_empty() {
         return Err(Error::Io(std::io::Error::new(
@@ -320,7 +322,11 @@ fn build_attacks(cli: &Cli) -> Result<Vec<Box<dyn Attack>>> {
     // wordlist-driven attacks, then the gated brute fallback. KoreK and bias take
     // the aircrack-style fudge / bruteforce / keyspace tuning from the CLI.
     let tuning = attack::Tuning { ffact: cli.fudge, brute_tail: cli.bruteforce.min(4), alnum: cli.alnum };
+    // SKA first: it only fires when a shared-key handshake was captured (otherwise
+    // inapplicable and skipped), so a handshake-bearing network is credited to SKA
+    // while every other network falls straight through to PTW (FR-ATK-1).
     let mut attacks: Vec<Box<dyn Attack>> = vec![
+        Box::new(SkaAttack { tuning }),
         Box::new(PtwAttack { tuning }),
         Box::new(KorekAttack { tuning }),
         Box::new(FmsAttack),
@@ -352,20 +358,34 @@ fn parse_mac(spec: &str) -> Option<Mac> {
 /// Reports what each WEP network yielded and, when uncracked, why -- too thin
 /// for any attack, or enough material but no single recoverable key.
 fn attack_diagnostics(debug: &DebugPrinter, bssids: &BTreeMap<Mac, BssidWep>, cracks: &[CrackResult]) {
+    // Most uncracked WEP BSSIDs detailed before the remainder collapses to a count.
+    const DEBUG_ATTACK_ROWS: usize = 256;
     if !debug.enabled() {
         return;
     }
     let cracked: HashMap<Mac, &CrackResult> = cracks.iter().map(|c| (c.bssid, c)).collect();
     let floor = attack::min_samples(KeyLen::Wep40);
+
+    // The cracked networks are the run's results -- report every one (deterministic
+    // BTreeMap order), however many WEP BSSIDs were observed.
     for (mac, b) in bssids.iter().filter(|(_, b)| b.encryption() == Encryption::Wep) {
+        if let Some(c) = cracked.get(mac) {
+            let uniq = attack::unique_iv_count(b);
+            debug.say(&format!("attack {mac}: cracked via {} (key_id {}, {uniq} unique IVs)", c.attack, c.key_id));
+        }
+    }
+
+    // The uncracked WEP networks, most-IVs first and capped: the high-IV ones are
+    // worth investigating, while the thin long tail collapses to a count so a
+    // million-BSSID corpus does not emit a million "why uncracked" lines.
+    let mut uncracked: Vec<&BssidWep> =
+        bssids.values().filter(|b| b.encryption() == Encryption::Wep && !cracked.contains_key(&b.bssid)).collect();
+    uncracked.sort_by(|a, b| attack::unique_iv_count(b).cmp(&attack::unique_iv_count(a)).then(a.bssid.cmp(&b.bssid)));
+    for b in uncracked.iter().take(DEBUG_ATTACK_ROWS) {
         // Unique IVs are the real material; raw frames overstate a replayed capture.
         let uniq = attack::unique_iv_count(b);
-        let raw = b.ivs.len() + b.arp_keystreams.len();
+        let raw = b.ivs().len() + b.arp_keystreams().len();
         let slots = b.key_ids_seen.count_ones();
-        if let Some(c) = cracked.get(mac) {
-            debug.say(&format!("attack {mac}: cracked via {} (key_id {}, {uniq} unique IVs)", c.attack, c.key_id));
-            continue;
-        }
         // Which key lengths cleared the feasibility floor on the unique-IV count?
         let feasible: Vec<String> = KeyLen::all()
             .iter()
@@ -376,7 +396,8 @@ fn attack_diagnostics(debug: &DebugPrinter, bssids: &BTreeMap<Mac, BssidWep>, cr
             // Below even the WEP-40 floor: report how far short the capture falls.
             let short = floor.saturating_sub(uniq);
             debug.say(&format!(
-                "attack {mac}: uncracked -- thin ({uniq} unique IVs from {raw} frames; WEP-40 floor is {floor}, ~{short} more needed)"
+                "attack {}: uncracked -- thin ({uniq} unique IVs from {raw} frames; WEP-40 floor is {floor}, ~{short} more needed)",
+                b.bssid
             ));
         } else {
             // Enough material but no verified key: name the likely cause so the
@@ -387,10 +408,17 @@ fn attack_diagnostics(debug: &DebugPrinter, bssids: &BTreeMap<Mac, BssidWep>, cr
                 "below the practical packet count, or sparse known-plaintext (no ARP/IP)".to_owned()
             };
             debug.say(&format!(
-                "attack {mac}: uncracked -- {uniq} unique IVs from {raw} frames, enough for WEP-{} but no key verified ({cause})",
+                "attack {}: uncracked -- {uniq} unique IVs from {raw} frames, enough for WEP-{} but no key verified ({cause})",
+                b.bssid,
                 feasible.join("/")
             ));
         }
+    }
+    if uncracked.len() > DEBUG_ATTACK_ROWS {
+        debug.say(&format!(
+            "attack ... and {} more uncracked WEP BSSIDs (fewer IVs, not shown)",
+            uncracked.len() - DEBUG_ATTACK_ROWS
+        ));
     }
 }
 
@@ -448,14 +476,18 @@ mod tests {
         let thin = BssidWep {
             bssid: Mac::from_bytes([1; 6]),
             saw_wep_data: true,
-            ivs: vec![IvSample::new([1, 2, 3], &[0u8; 8])],
-            ..Default::default()
+            ..BssidWep::with_material(crate::model::WepMaterial {
+                ivs: vec![IvSample::new([1, 2, 3], &[0u8; 8])],
+                ..Default::default()
+            })
         };
         let rich = BssidWep {
             bssid: Mac::from_bytes([2; 6]),
             saw_wep_data: true,
-            ivs: (0..floor as u32).map(|c| IvSample::new([c as u8, (c >> 8) as u8, 0], &[0u8; 8])).collect(),
-            ..Default::default()
+            ..BssidWep::with_material(crate::model::WepMaterial {
+                ivs: (0..floor as u32).map(|c| IvSample::new([c as u8, (c >> 8) as u8, 0], &[0u8; 8])).collect(),
+                ..Default::default()
+            })
         };
         let mut map = BTreeMap::new();
         map.insert(thin.bssid, thin);

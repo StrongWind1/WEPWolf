@@ -260,7 +260,10 @@ fn observe_protected_data(record: &mut BssidWep, dst: Mac, body: &[u8]) -> Carve
     record.key_ids_seen |= 1u8 << view.key_id;
 
     // Short keystream from the LLC/SNAP prefix (always present) -> FMS / KoreK.
-    record.ivs.push(IvSample::new(view.iv, &xor_prefix(view.payload, &SNAP_PREFIX)).with_key_id(view.key_id));
+    record
+        .material_mut()
+        .ivs
+        .push(IvSample::new(view.iv, &xor_prefix(view.payload, &SNAP_PREFIX)).with_key_id(view.key_id));
 
     // Longer PTW keystream from known plaintext. ARP is detected by its fixed MSDU
     // length; otherwise the cleartext Destination Address picks the L3 family
@@ -271,6 +274,7 @@ fn observe_protected_data(record: &mut BssidWep, dst: Mac, body: &[u8]) -> Carve
     let msdu_len = view.payload.len().checked_sub(4);
     if msdu_len.is_some_and(|n| ARP_MSDU_LENS.contains(&n)) {
         record
+            .material_mut()
             .arp_keystreams
             .push(IvSample::new(view.iv, &xor_prefix(view.payload, &ARP_KNOWN)).with_key_id(view.key_id));
     } else {
@@ -279,6 +283,7 @@ fn observe_protected_data(record: &mut BssidWep, dst: Mac, body: &[u8]) -> Carve
                 // IPv6 ND / `ICMPv6`: a long, checksum-free, highly-predictable header.
                 if let Some(known) = ipv6_nd_known_plaintext(view.payload.len()) {
                     record
+                        .material_mut()
                         .arp_keystreams
                         .push(IvSample::new(view.iv, &xor_prefix(view.payload, &known)).with_key_id(view.key_id));
                 }
@@ -286,6 +291,7 @@ fn observe_protected_data(record: &mut BssidWep, dst: Mac, body: &[u8]) -> Carve
             DstHint::Eapol => {
                 // 802.1X: only the SNAP + `EtherType` is reliably fixed.
                 record
+                    .material_mut()
                     .arp_keystreams
                     .push(IvSample::new(view.iv, &xor_prefix(view.payload, &EAPOL_KNOWN)).with_key_id(view.key_id));
             },
@@ -294,7 +300,7 @@ fn observe_protected_data(record: &mut BssidWep, dst: Mac, body: &[u8]) -> Carve
                 // Don't-Fragment octet (keystream index 14) is dual-valued, so mark
                 // it for two-keystream voting (FR-WEP-3).
                 if let Some(ip_known) = ip_known_plaintext(view.payload.len()) {
-                    record.arp_keystreams.push(
+                    record.material_mut().arp_keystreams.push(
                         IvSample::new_ip(view.iv, &xor_prefix(view.payload, &ip_known), IP_DF_INDEX)
                             .with_key_id(view.key_id),
                     );
@@ -331,9 +337,9 @@ fn observe_auth(
             let keystream = xor_prefix(view.payload, &known);
             // The long SKA keystream bootstraps the statistical attacks as one
             // more IV sample (FR-ATK-SKA-1).
-            record.arp_keystreams.push(IvSample::new(view.iv, &keystream).with_key_id(view.key_id));
-            if record.ska_keystream.is_none() {
-                record.ska_keystream = Some(keystream);
+            record.material_mut().arp_keystreams.push(IvSample::new(view.iv, &keystream).with_key_id(view.key_id));
+            if record.ska_keystream().is_none() {
+                record.material_mut().ska_keystream = Some(keystream);
             }
         }
         record.retain_enc_frame(EncFrame { iv: view.iv, data: view.payload.to_vec(), key_id: view.key_id });
@@ -452,12 +458,12 @@ mod tests {
         let r = &m[&Mac::default()];
         assert_eq!(r.encryption(), Encryption::Wep);
         assert_eq!(r.wep_data_frames, 1);
-        assert_eq!(r.ivs.len(), 1);
-        assert_eq!(r.ivs[0].iv, [0x01, 0x02, 0x03]);
+        assert_eq!(r.ivs().len(), 1);
+        assert_eq!(r.ivs()[0].iv, [0x01, 0x02, 0x03]);
         // keystream[0] = cipher[0] ^ 0xAA = 0xEE; [1] = ^0xAA = 0x11; [2] = ^0x03 = 0x22.
-        assert_eq!(&r.ivs[0].keystream()[0..3], &[0xEE, 0x11, 0x22]);
+        assert_eq!(&r.ivs()[0].keystream()[0..3], &[0xEE, 0x11, 0x22]);
         assert_eq!(r.key_ids_seen, 0b0001);
-        assert_eq!(r.enc_frames.len(), 1);
+        assert_eq!(r.enc_frames().len(), 1);
     }
 
     #[test]
@@ -469,8 +475,8 @@ mod tests {
         body.extend_from_slice(&[0xAA; 24]); // 24-octet payload -> MSDU 20 -> IP path
         let m = run(&[(hdr(Mac::default(), Mac::default(), TYPE_DATA, 0, true), body)]);
         let r = &m[&Mac::default()];
-        assert_eq!(r.arp_keystreams.len(), 1);
-        assert_eq!(r.arp_keystreams[0].df_index, Some(14));
+        assert_eq!(r.arp_keystreams().len(), 1);
+        assert_eq!(r.arp_keystreams()[0].df_index, Some(14));
     }
 
     #[test]
@@ -497,11 +503,11 @@ mod tests {
         body.extend_from_slice(&payload);
         let dst = Mac::from_bytes([0x33, 0x33, 0x00, 0x00, 0x00, 0x01]); // ff02::1 all-nodes
         let r = &run(&[(data_hdr_to(Mac::default(), dst), body)])[&Mac::default()];
-        assert_eq!(r.arp_keystreams.len(), 1, "an IPv6 ND sample is harvested");
-        assert_eq!(r.arp_keystreams[0].df_index, None, "IPv6 sample has no IPv4 DF octet");
+        assert_eq!(r.arp_keystreams().len(), 1, "an IPv6 ND sample is harvested");
+        assert_eq!(r.arp_keystreams()[0].df_index, None, "IPv6 sample has no IPv4 DF octet");
         // payload equals the known plaintext over the prefix, so keystream is zero --
         // proving the IPv6 ND known plaintext (not the IPv4 guess) was applied.
-        assert_eq!(&r.arp_keystreams[0].keystream()[..16], &[0u8; 16], "IPv6 ND known plaintext applied");
+        assert_eq!(&r.arp_keystreams()[0].keystream()[..16], &[0u8; 16], "IPv6 ND known plaintext applied");
     }
 
     #[test]
@@ -514,8 +520,8 @@ mod tests {
         body.extend_from_slice(&payload);
         let dst = Mac::from_bytes([0x01, 0x80, 0xc2, 0x00, 0x00, 0x03]);
         let r = &run(&[(data_hdr_to(Mac::default(), dst), body)])[&Mac::default()];
-        assert_eq!(r.arp_keystreams.len(), 1);
-        assert_eq!(&r.arp_keystreams[0].keystream()[..8], &[0u8; 8], "EAPOL known plaintext applied");
+        assert_eq!(r.arp_keystreams().len(), 1);
+        assert_eq!(&r.arp_keystreams()[0].keystream()[..8], &[0u8; 8], "EAPOL known plaintext applied");
     }
 
     #[test]
@@ -526,8 +532,8 @@ mod tests {
         body.extend_from_slice(&[0xAA; 24]); // MSDU 20 -> IP path
         let dst = Mac::from_bytes([0x01, 0x00, 0x5e, 0x00, 0x00, 0xfb]);
         let r = &run(&[(data_hdr_to(Mac::default(), dst), body)])[&Mac::default()];
-        assert_eq!(r.arp_keystreams.len(), 1);
-        assert_eq!(r.arp_keystreams[0].df_index, Some(14), "IPv4 DF octet marked for two-keystream voting");
+        assert_eq!(r.arp_keystreams().len(), 1);
+        assert_eq!(r.arp_keystreams()[0].df_index, Some(14), "IPv4 DF octet marked for two-keystream voting");
     }
 
     #[test]
@@ -537,7 +543,7 @@ mod tests {
         let r = &run(&[(hdr(Mac::default(), Mac::default(), TYPE_DATA, 0, true), body)])[&Mac::default()];
         assert_eq!(r.encryption(), Encryption::Wpa);
         assert_eq!(r.wep_data_frames, 0);
-        assert!(r.ivs.is_empty());
+        assert!(r.ivs().is_empty());
     }
 
     #[test]
@@ -568,7 +574,7 @@ mod tests {
         let r = &m[&ap];
         assert_eq!(r.encryption(), Encryption::Wep);
         assert_eq!(r.wep_auth_frames, 1);
-        let ks = r.ska_keystream.as_ref().expect("ska keystream recovered");
+        let ks = r.ska_keystream().expect("ska keystream recovered");
         // The recovered keystream over the known prefix must match what we used.
         let known_len = 8 + challenge.len();
         assert_eq!(&ks[..known_len], &keystream.iter().cycle().take(known_len).copied().collect::<Vec<_>>()[..]);

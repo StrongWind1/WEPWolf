@@ -183,7 +183,7 @@ fn ipv6_nd_known_plaintext_harvested() {
     let frame = wep_data_frame_to(bssid, dst, key, iv, &plaintext);
     let result = scan_bytes(&build_pcap(DLT_IEEE802_11, &[frame]), "ipv6nd");
     let rec = result.bssids.get(&Mac::from_bytes(bssid)).expect("bssid present");
-    let ipv6 = rec.arp_keystreams.iter().find(|s| s.df_index.is_none()).expect("an IPv6 ND sample was harvested");
+    let ipv6 = rec.arp_keystreams().iter().find(|s| s.df_index.is_none()).expect("an IPv6 ND sample was harvested");
     let mut seed = iv.to_vec();
     seed.extend_from_slice(key);
     let mut ks = [0u8; 16];
@@ -219,13 +219,13 @@ fn harvested_wep_verifies_with_known_key() {
     let r = result.bssids.get(&Mac::from_bytes(bssid)).expect("bssid present");
     assert_eq!(r.encryption(), Encryption::Wep);
     assert_eq!(r.wep_data_frames, 3);
-    assert_eq!(r.ivs.len(), 3, "one IV sample per WEP data frame");
+    assert_eq!(r.ivs().len(), 3, "one IV sample per WEP data frame");
     // Every long-enough frame yields a PTW keystream: the 36-octet MSDU as ARP,
     // and the two ordinary frames via the reconstructed IPv4 header (FR-ATK-PTW-1).
-    assert_eq!(r.arp_keystreams.len(), 3, "long known-plaintext keystreams: 2 IP-reconstructed + 1 ARP");
+    assert_eq!(r.arp_keystreams().len(), 3, "long known-plaintext keystreams: 2 IP-reconstructed + 1 ARP");
     assert_eq!(r.key_ids_seen, 0b0001, "key id 0 observed");
 
-    let verifier = Verifier::new(r.enc_frames.clone());
+    let verifier = Verifier::new(r.enc_frames().to_vec());
     assert!(verifier.accept(&WepKey::new(&key).unwrap()), "the correct key must be accepted");
     assert!(!verifier.accept(&WepKey::new(&[0x11, 0x22, 0x33, 0x44, 0x56]).unwrap()), "a wrong key must be rejected");
 }
@@ -257,14 +257,14 @@ fn shared_key_auth_recovers_keystream() {
     let r = result.bssids.get(&Mac::from_bytes(bssid)).expect("bssid present");
     assert_eq!(r.encryption(), Encryption::Wep);
     assert_eq!(r.wep_auth_frames, 1);
-    let ks = r.ska_keystream.as_ref().expect("ska keystream recovered");
+    let ks = r.ska_keystream().expect("ska keystream recovered");
     let known_len = 8 + challenge.len();
     let expected: Vec<u8> = keystream.iter().cycle().take(known_len).copied().collect();
     assert_eq!(&ks[..known_len], &expected[..], "recovered keystream matches the known plaintext XOR");
     // FR-ATK-SKA-1: the SKA keystream is also handed to the statistical attacks
     // as an IV sample, so an auth-only capture can still bootstrap a crack.
-    assert_eq!(r.arp_keystreams.len(), 1, "SKA keystream feeds the attack sample pool");
-    assert_eq!(r.arp_keystreams[0].iv, [0x09, 0x09, 0x09], "the sample carries the frame-3 IV");
+    assert_eq!(r.arp_keystreams().len(), 1, "SKA keystream feeds the attack sample pool");
+    assert_eq!(r.arp_keystreams()[0].iv, [0x09, 0x09, 0x09], "the sample carries the frame-3 IV");
 }
 
 #[test]
@@ -373,7 +373,7 @@ fn parallel_ingest_is_deterministic() {
         let result = scan::scan(&paths, &debug, &mut logger, &mut mem, &progress, None).unwrap();
         let rec = result.bssids.get(&Mac::from_bytes(bssid)).expect("merged bssid present");
         assert_eq!(result.stats.captures_read, 3, "all three files counted");
-        rec.ivs.iter().map(|s| s.iv[0]).collect::<Vec<u8>>()
+        rec.ivs().iter().map(|s| s.iv[0]).collect::<Vec<u8>>()
     };
 
     let first = iv_order();

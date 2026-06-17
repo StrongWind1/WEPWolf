@@ -4,9 +4,10 @@
 //! is streamed with bounded memory -- only the per-BSSID records are retained,
 //! never the whole file (FR-IN-5).
 //!
-//! With `--debug` it emits per-file ingest lines and a per-BSSID material dump
-//! (encryption, IV/ARP/SKA counts, WEP frame totals) for parser/classify
-//! diagnostics (FR-DEBUG-2).
+//! With `--debug` it emits a periodic ingest heartbeat (not a line per file -- a
+//! megacorpus holds millions) and a bounded per-BSSID material dump: WEP BSSIDs
+//! most-IVs-first capped at a few hundred, with the thin remainder and the non-WEP
+//! networks collapsed into census counts (FR-DEBUG-2).
 //!
 //! The input files are ingested in parallel on the work-stealing pool (FR-IN-6):
 //! each file is opened, streamed, and folded into its own per-BSSID map and
@@ -28,7 +29,7 @@ use rayon::iter::{IntoParallelRefIterator as _, ParallelIterator as _};
 
 use crate::carve::Carver;
 use crate::classify::{self, Carve, ChallengeCache};
-use crate::diag::{DebugPrinter, LogEvent, Logger, MemMonitor};
+use crate::diag::{DebugPrinter, EventTally, LogEvent, Logger, MemMonitor};
 use crate::ieee80211::frame::{self, ParseResult, TYPE_DATA, TYPE_MANAGEMENT};
 use crate::input::{self, Packet};
 use crate::link;
@@ -45,6 +46,15 @@ use crate::types::Result;
 /// thread saturates the pool through file-size variance without holding every
 /// file's material at once.
 const INGEST_BATCH_PER_THREAD: usize = 4;
+
+/// Files between `--debug` ingest heartbeats. A megacorpus has millions of files,
+/// so a line per file is spam; a count tick every this many keeps the operator
+/// informed without flooding stderr (FR-DEBUG-1's bounded-volume intent).
+const INGEST_TICK_FILES: u64 = 50_000;
+
+/// Most WEP BSSIDs detailed in the `--debug` per-BSSID material dump before the
+/// remainder collapses to a count, so a million-BSSID input stays readable.
+const DEBUG_BSSID_ROWS: usize = 256;
 
 /// The outcome of scanning the inputs: per-BSSID WEP records plus run accounting.
 #[derive(Debug)]
@@ -93,15 +103,16 @@ pub fn scan(
     let mut bssids: BTreeMap<Mac, BssidWep> = BTreeMap::new();
     let mut stats = Stats::default();
     let batch_size = rayon::current_num_threads().max(1).saturating_mul(INGEST_BATCH_PER_THREAD);
+    // Files at the last emitted `--debug` ingest heartbeat (see INGEST_TICK_FILES).
+    let mut ticked = 0u64;
     for batch in paths.chunks(batch_size) {
-        let partials: Vec<(String, BTreeMap<Mac, BssidWep>, Stats, Vec<LogEvent>)> = batch
+        let partials: Vec<(String, BTreeMap<Mac, BssidWep>, Stats, EventTally)> = batch
             .par_iter()
             .map(|path| {
                 let name = path.display().to_string();
-                debug.say(&format!("ingest file={name}"));
                 let mut file_bssids: BTreeMap<Mac, BssidWep> = BTreeMap::new();
                 let mut file_stats = Stats::default();
-                let mut events: Vec<LogEvent> = Vec::new();
+                let mut events = EventTally::default();
                 match input::open_reader(path) {
                     Ok(mut reader) => {
                         file_stats.captures_read += 1;
@@ -124,7 +135,7 @@ pub fn scan(
                     },
                     Err(e) => {
                         if log_active {
-                            events.push(LogEvent::CaptureError(format!("{e}")));
+                            events.record(LogEvent::CaptureError(format!("{e}")));
                         }
                         debug.say(&format!("skip file={name} reason={e}"));
                     },
@@ -145,22 +156,19 @@ pub fn scan(
             }
             logger.replay(&name, events);
         }
+        // A periodic --debug heartbeat instead of a line per file -- a megacorpus
+        // holds millions of files, so per-file ingest lines would dominate the log.
+        let done = files_done.load(Ordering::Relaxed);
+        if debug.enabled() && done - ticked >= INGEST_TICK_FILES {
+            ticked = done;
+            debug.say(&format!("ingested {done}/{} files", paths.len()));
+        }
     }
     spinner.finish();
 
     tally_bssids(&bssids, &mut stats);
     if debug.enabled() {
-        for (mac, r) in &bssids {
-            debug.say(&format!(
-                "bssid {mac} {} ivs={} arp={} ska={} wep_data={} wep_auth={}",
-                enc_word(r.encryption()),
-                r.ivs.len(),
-                r.arp_keystreams.len(),
-                r.ska_keystream.is_some(),
-                r.wep_data_frames,
-                r.wep_auth_frames
-            ));
-        }
+        dump_bssid_material(debug, &bssids);
     }
     Ok(ScanResult { bssids, stats })
 }
@@ -177,7 +185,7 @@ fn scan_file(
     challenges: &mut ChallengeCache,
     stats: &mut Stats,
     log_active: bool,
-    events: &mut Vec<LogEvent>,
+    events: &mut EventTally,
     carve: Option<&Mutex<&mut Carver>>,
     spinner: &Bar,
     packets: &AtomicU64,
@@ -189,7 +197,7 @@ fn scan_file(
             Ok(None) => break,
             Err(e) => {
                 if log_active {
-                    events.push(LogEvent::CaptureError(format!("read error: {e}")));
+                    events.record(LogEvent::CaptureError(format!("read error: {e}")));
                 }
                 break;
             },
@@ -212,7 +220,7 @@ fn scan_file(
         } else {
             stats.packets_unknown_link += 1;
             if log_active {
-                events.push(LogEvent::UnknownLink(packet.interface_id));
+                events.record(LogEvent::UnknownLink(packet.interface_id));
             }
         }
         reader.recycle_buffer(packet.data);
@@ -233,7 +241,7 @@ fn process_packet(
     challenges: &mut ChallengeCache,
     stats: &mut Stats,
     log_active: bool,
-    events: &mut Vec<LogEvent>,
+    events: &mut EventTally,
     carve: Option<&Mutex<&mut Carver>>,
 ) {
     let Some(frame_bytes) = strip_and_resolve(packet, dlt, stats, log_active, events) else {
@@ -245,7 +253,7 @@ fn process_packet(
         ParseResult::Malformed(reason) => {
             stats.malformed_mac += 1;
             if log_active {
-                events.push(LogEvent::Malformed(reason.to_owned()));
+                events.record(LogEvent::Malformed(reason.to_owned()));
             }
         },
         ParseResult::Frame(hdr) | ParseResult::Lenient(hdr) => {
@@ -291,7 +299,7 @@ fn strip_and_resolve<'a>(
     dlt: u16,
     stats: &mut Stats,
     log_active: bool,
-    events: &mut Vec<LogEvent>,
+    events: &mut EventTally,
 ) -> Option<&'a [u8]> {
     match link::strip(&packet.data, dlt) {
         Ok((payload, header_says_fcs)) => {
@@ -302,7 +310,7 @@ fn strip_and_resolve<'a>(
         Err(e) => link::recover::recover(&packet.data, dlt).map(|r| r.frame).or_else(|| {
             stats.link_errors += 1;
             if log_active {
-                events.push(LogEvent::LinkError { dlt, reason: format!("{e}") });
+                events.record(LogEvent::LinkError { dlt, reason: format!("{e}") });
             }
             None
         }),
@@ -322,6 +330,45 @@ fn tally_bssids(bssids: &BTreeMap<Mac, BssidWep>, stats: &mut Stats) {
         stats.wep_data_frames += record.wep_data_frames;
         stats.wep_auth_frames += record.wep_auth_frames;
     }
+}
+
+/// Bounded per-BSSID material dump for `--debug` (FR-DEBUG-2).
+///
+/// Only WEP BSSIDs are detailed -- they are the cracker's targets -- most-IVs
+/// first and capped at [`DEBUG_BSSID_ROWS`]; the thinner remainder collapses to a
+/// count, and the non-WEP networks (the overwhelming majority on a real corpus)
+/// become a one-line census instead of millions of per-BSSID lines.
+fn dump_bssid_material(debug: &DebugPrinter, bssids: &BTreeMap<Mac, BssidWep>) {
+    let mut wep: Vec<&BssidWep> = bssids.values().filter(|b| b.encryption() == Encryption::Wep).collect();
+    wep.sort_by(|a, b| {
+        crate::attack::unique_iv_count(b).cmp(&crate::attack::unique_iv_count(a)).then(a.bssid.cmp(&b.bssid))
+    });
+    for r in wep.iter().take(DEBUG_BSSID_ROWS) {
+        debug.say(&format!(
+            "bssid {} {} ivs={} arp={} ska={} wep_data={} wep_auth={}",
+            r.bssid,
+            enc_word(r.encryption()),
+            r.ivs().len(),
+            r.arp_keystreams().len(),
+            r.ska_keystream().is_some(),
+            r.wep_data_frames,
+            r.wep_auth_frames
+        ));
+    }
+    if wep.len() > DEBUG_BSSID_ROWS {
+        debug.say(&format!("bssid ... and {} more WEP BSSIDs (fewer IVs, not shown)", wep.len() - DEBUG_BSSID_ROWS));
+    }
+    // Non-WEP networks are a census count, never per-BSSID spam.
+    let (mut wpa, mut open, mut unknown) = (0u64, 0u64, 0u64);
+    for b in bssids.values() {
+        match b.encryption() {
+            Encryption::Wpa => wpa += 1,
+            Encryption::Open => open += 1,
+            Encryption::Unknown => unknown += 1,
+            Encryption::Wep => {},
+        }
+    }
+    debug.say(&format!("bssid census: {} WEP, {wpa} WPA, {open} open, {unknown} unknown", wep.len()));
 }
 
 /// A short word for an encryption class, for debug lines.
