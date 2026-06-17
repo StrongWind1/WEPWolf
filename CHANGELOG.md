@@ -4,6 +4,23 @@ All notable changes to WEPWolf are documented here. The format follows [Keep a C
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-06-17
+
+### Added
+
+- Shared-Key-authentication bootstrap attack (`ska`, FR-ATK-SKA-1): when a capture carries a Shared-Key auth handshake, its leaked keystream is harvested into the BSSID's sample pool and this attack runs the shared PTW sigma vote over that pool, attributing the recovery to SKA. It runs first but only when a handshake is present, so every other network falls straight through to PTW, and `keys_by_ska` now reflects handshake-bearing cracks. It is a bootstrap, not a standalone cipher break -- a lone handshake (a single sample) cannot converge passively, so it leans on the pooled votes; every key it returns is still confirmed by the `Verifier` (C4).
+
+### Changed
+
+- Parallel capture discovery: a directory walk now collects candidate files with a metadata-only pass and magic-filters them on the work-stealing pool, instead of opening every file serially before ingest begins. On a large tree this turns a long serial stall into a fast walk plus a parallel filter, and the order is preserved so the merged result stays deterministic (FR-IN-6). The redundant per-file magic open is gone -- ingest already re-detects the format -- and `--debug` now announces the discovery phase.
+- Lower ingest-time peak memory (FR-IN-5): a BSSID's heavy WEP attack material (IV samples, ARP/PTW keystreams, retained frames) is boxed and allocated only when the first WEP frame is seen, so the WPA/open/unknown majority of records -- the dominant cost on a multi-million-BSSID input -- stay small.
+- Bounded diagnostics at scale (FR-DEBUG): `--debug` prints the top WEP BSSIDs by unique-IV count plus a one-line non-WEP census rather than a line per BSSID, and a periodic ingest heartbeat rather than a line per file; `--log` coalesces repeated identical events per file into a single `count=N` line, so one corrupt capture can no longer flood the log or balloon the per-file buffer.
+- The WEP-BSSID summary lists every network at or above the WEP-40 unique-IV feasibility floor (or cracked) and collapses the thin tail into a count, replacing the fixed 25-row cap (FR-OUT).
+- Per-BSSID crack time (FR-OUT-2): the reported `seconds` is now the wall-clock actually spent cracking that network, not the time from the start of the attack phase, so a fast crack reads as fast even when it lands late in the parallel sweep.
+- Fair per-attack scheduling (FR-PERF-3): the per-BSSID time budget is split into an equal slice per runnable statistical attack, set fresh before each one in the full pass, so a slow earlier attack (for example PTW's deep ladder) can no longer starve KoreK/FMS/bias of their turn.
+- `--time-budget` now defaults to 60 seconds and bounds the statistical sweep and the brute grind alike; `--time-budget 0` disables the cap (unlimited) for both. Previously the sweep defaulted to 30 s, the brute was unbounded, and `0` did not unbound the sweep (FR-PERF-3).
+- Reuse the packet data buffer across reads during ingest, avoiding a heap allocation per packet.
+
 ## [0.1.0] - 2026-06-16
 
 ### Added
@@ -47,5 +64,6 @@ All notable changes to WEPWolf are documented here. The format follows [Keep a C
 - WEPWolf is passive and offline: it reads capture files only, and never captures traffic, injects frames, or touches a radio.
 - On the aircrack-ng `wep_64_ptw.cap` reference capture it recovers the key in roughly a fifth of a second.
 
-[Unreleased]: https://github.com/StrongWind1/WEPWolf/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/StrongWind1/WEPWolf/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/StrongWind1/WEPWolf/compare/v0.1.0...v1.0.0
 [0.1.0]: https://github.com/StrongWind1/WEPWolf/releases/tag/v0.1.0
