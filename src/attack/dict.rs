@@ -12,6 +12,32 @@ use super::Attack;
 use crate::model::{BssidWep, KeyLen, WepKey};
 use crate::wep::Verifier;
 
+/// Built-in common/weak WEP keys, tried as a dictionary even without `--wordlist`.
+///
+/// (FR-ATK-DICT-1.) Each entry is attempted both as raw octets and as decoded hex,
+/// so one entry covers an ASCII key and a hex-typed key alike. Seeded from the keys
+/// that recur across real captures -- the hex `1234567890` and ASCII `12345` dominate
+/// -- plus obvious weak patterns and a few universal defaults. The check is near-free
+/// and runs in the cheap quick pass, so a default-key network -- including a thin one
+/// statistics cannot touch -- cracks before any expensive ladder. Extend freely.
+pub const COMMON_KEYS: &[&str] = &[
+    // Recurring defaults seen across many distinct networks in real captures.
+    "1234567890",    // WEP-40, hex-typed -- by far the most common
+    "12345",         // WEP-40, ASCII
+    "1029384756102", // WEP-104, ASCII (reused across sibling APs)
+    "87654321PHARM", // WEP-104, ASCII (reused)
+    "498753686e",    // WEP-40, hex (reused)
+    "d89963dcae",    // WEP-40, hex (reused across co-located APs)
+    // Obvious weak patterns.
+    "1f1f1f1f1f", // a repeated octet
+    "1111122222", // a simple pattern
+    "1471471471", // 1471, repeated
+    "qwert",      // a keyboard run
+    // A few universal weak defaults, near-free to check.
+    "0000000000", // all-zero (hex)
+    "ffffffffff", // all-ones (hex)
+];
+
 /// A wordlist-backed key search.
 #[derive(Debug, Clone)]
 pub struct DictAttack {
@@ -19,7 +45,9 @@ pub struct DictAttack {
 }
 
 impl DictAttack {
-    /// Load a newline-separated wordlist (no default list is shipped, C-budget).
+    /// Load a newline-separated wordlist. The built-in [`COMMON_KEYS`] are always
+    /// tried too (wired in by the CLI), so even with no wordlist a default-key
+    /// network cracks; the shipped list stays tiny (C-budget).
     ///
     /// # Errors
     /// Returns the I/O error if the file cannot be read.

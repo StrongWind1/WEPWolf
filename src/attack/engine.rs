@@ -1,6 +1,6 @@
 //! The attack engine: run the registered attacks against a BSSID's material.
 //!
-//! Attacks run cheapest-first across the key-length hypotheses, and the first key the `Verifier` accepts (C4) wins. The cheap statistical/dictionary attacks run BSSID-parallel (the *sweep*); the gated 40-bit brute runs one BSSID at a time on the full pool (the *grind*), so two brute jobs never compete (FR-PERF-1). The aircrack parity-or-better bar (FR-PERF-4) is measured in `benches/`. Adding an attack is adding a `Box<dyn Attack>`.
+//! Attacks run cheapest-first across the key-length hypotheses, and the first key the `Verifier` accepts (C4) wins. The cheap statistical/dictionary attacks run BSSID-parallel (the *recovery* phase); the gated 40-bit brute force runs one BSSID at a time on the full pool, so two brute jobs never compete (FR-PERF-1). The aircrack parity-or-better bar (FR-PERF-4) is measured in `benches/`. Adding an attack is adding a `Box<dyn Attack>`.
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -10,6 +10,7 @@ use rayon::iter::{IntoParallelRefIterator as _, ParallelIterator as _};
 
 use super::Attack;
 use super::brute::{key_at, search_prefiltered};
+use crate::diag::DebugPrinter;
 use crate::model::{BssidWep, Encryption, KeyLen, Mac, WepKey};
 use crate::progress::Progress;
 use crate::wep::Verifier;
@@ -30,7 +31,7 @@ pub struct CrackResult {
     /// Wall-clock spent cracking this BSSID -- from when its attacks started to
     /// when the key verified (FR-OUT-2 `seconds`), not phase-relative, so a fast
     /// crack reads as fast even when it lands late in the parallel sweep. Stamped
-    /// per BSSID for the sweep, per brute for the grind, and the verify time for a
+    /// per BSSID for recovery, per brute for the brute force, and the verify time for a
     /// reused or seeded key.
     pub elapsed: Duration,
 }
@@ -40,15 +41,15 @@ pub struct CrackResult {
 pub struct CrackOutcome {
     /// One `CrackResult` per recovered key (per slot for a multi-key AP).
     pub cracks: Vec<CrackResult>,
-    /// Wall-clock in the parallel cheap-attack sweep (seed + sweep + reuse).
-    pub sweep: Duration,
-    /// Wall-clock in the serialised 40-bit brute grind.
-    pub grind: Duration,
+    /// Wall-clock in the key-recovery phase (seed + parallel attacks + reuse).
+    pub recovery: Duration,
+    /// Wall-clock in the serialised 40-bit brute-force search.
+    pub bruteforce: Duration,
 }
 
 /// Run the cheap `attacks` (already in cost order) against one BSSID, returning the first verified key (FR-ATK-1).
 ///
-/// The grind attacks (the brute) are skipped here -- [`crack_all`] runs them in a separate, serialised phase. Each attack tries the supplied key-length hypotheses shortest-first; the statistical attacks recover the length implicitly, so no length is favoured (FR-CLASSIFY-2). `--keylen` narrows `lengths` to a single size.
+/// The brute-force attack is skipped here -- [`crack_all`] runs it in a separate, serialised phase. Each attack tries the supplied key-length hypotheses shortest-first; the statistical attacks recover the length implicitly, so no length is favoured (FR-CLASSIFY-2). `--keylen` narrows `lengths` to a single size.
 #[must_use]
 pub fn crack(
     bssid: &BssidWep,
@@ -56,6 +57,25 @@ pub fn crack(
     attacks: &[Box<dyn Attack>],
     lengths: &[KeyLen],
     budget: Option<Duration>,
+) -> Option<CrackResult> {
+    crack_traced(bssid, verifier, attacks, lengths, budget, &DebugPrinter::new(false))
+}
+
+/// [`crack`] with per-attack `--debug` tracing (FR-DEBUG-3): a `start` line before
+/// each attack runs and an end line after, carrying the BSSID, attack, key length,
+/// pass, the wall-clock it took, and why it stopped -- `recovered`, `deadline` (the
+/// per-attack budget ran out), or `no key` (the search finished with no signal).
+/// This is what shows whether a high-IV but uncrackable network (e.g. one with no
+/// ARP/IP known-plaintext) was actually attempted and where its time went. Lines
+/// stream live from the parallel sweep, so they interleave across BSSIDs but each
+/// is self-contained; pass `--bssid` to trace one network cleanly.
+fn crack_traced(
+    bssid: &BssidWep,
+    verifier: &Verifier,
+    attacks: &[Box<dyn Attack>],
+    lengths: &[KeyLen],
+    budget: Option<Duration>,
+    debug: &DebugPrinter,
 ) -> Option<CrackResult> {
     // Two passes: a quick pass runs only the cheap argmax/top-k search of every
     // attack across every key length, then a full pass adds the expensive
@@ -80,8 +100,11 @@ pub fn crack(
     .unwrap_or(1)
     .max(1);
     let slice = budget.map(|b| b / runnable);
+    // Unique-IV count for the full-pass convergence gate below (computed once).
+    let ivs = super::unique_iv_count(bssid);
     for quick in [true, false] {
         super::set_quick(quick);
+        let pass = if quick { "quick" } else { "full" };
         for attack in attacks {
             if attack.is_grind() {
                 continue;
@@ -91,9 +114,43 @@ pub fn crack(
             let window = if quick { budget } else { slice };
             super::set_deadline(window.and_then(|w| Instant::now().checked_add(w)));
             for &len in lengths {
-                if attack.applicable(bssid, len)
-                    && let Some(key) = attack.run(bssid, len, verifier)
-                {
+                if !attack.applicable(bssid, len) {
+                    continue;
+                }
+                // Deep ladders only where they converge: in the full pass, skip a
+                // convergence-bound attack (PTW/KoreK/bias) on a network with too few
+                // unique IVs. It already got the cheap quick pass and the dictionary /
+                // common-key checks, so this only avoids burning its budget on a
+                // hopeless backtracking search (FR-PERF-3).
+                if !quick && attack.needs_convergence() && ivs < super::min_samples(len) {
+                    continue;
+                }
+                // Trace each attack start/stop (FR-DEBUG-3): a `start` with no
+                // following key, or a `deadline` end, shows the attack ran on this
+                // network and why it gave up -- so a stuck or skipped high-IV BSSID
+                // is no longer invisible. Bounded by `--debug` and the applicable set.
+                if debug.enabled() {
+                    debug.say(&format!("attack {} {}/{} {pass}: start", bssid.bssid, attack.name(), len.bits()));
+                }
+                let started = Instant::now();
+                let found = attack.run(bssid, len, verifier);
+                if debug.enabled() {
+                    let why = if found.is_some() {
+                        "recovered"
+                    } else if super::deadline_passed() {
+                        "deadline"
+                    } else {
+                        "no key"
+                    };
+                    debug.say(&format!(
+                        "attack {} {}/{} {pass}: {why} in {:.3}s",
+                        bssid.bssid,
+                        attack.name(),
+                        len.bits(),
+                        started.elapsed().as_secs_f64()
+                    ));
+                }
+                if let Some(key) = found {
                     super::set_quick(false);
                     super::set_deadline(None);
                     return Some(result(bssid, key, attack.name()));
@@ -158,11 +215,12 @@ fn crack_slots(
     attacks: &[Box<dyn Attack>],
     lengths: &[KeyLen],
     budget: Option<Duration>,
+    debug: &DebugPrinter,
 ) -> Vec<CrackResult> {
     let slots = active_slots(bssid.key_ids_seen);
     if slots.len() <= 1 {
         let verifier = Verifier::new(bssid.enc_frames().to_vec());
-        return crack(bssid, &verifier, attacks, lengths, budget).into_iter().collect();
+        return crack_traced(bssid, &verifier, attacks, lengths, budget, debug).into_iter().collect();
     }
     // Share the per-BSSID budget across the slots so a multi-slot AP cannot run
     // longer overall than a single-slot one (FR-PERF-3).
@@ -172,7 +230,7 @@ fn crack_slots(
         .filter_map(|slot| {
             let view = slot_view(bssid, slot);
             let verifier = Verifier::new(view.enc_frames().to_vec());
-            crack(&view, &verifier, attacks, lengths, per_slot).map(|mut found| {
+            crack_traced(&view, &verifier, attacks, lengths, per_slot, debug).map(|mut found| {
                 found.key_id = slot;
                 found
             })
@@ -185,17 +243,40 @@ fn row(crack: &CrackResult) -> String {
     format!("  cracked {} via {:<6} key {}", crack.bssid, crack.attack, crack.key)
 }
 
+/// The per-BSSID recovery budget: an IV-scaled share of the `--per-bssid-time-max`
+/// cap, never exceeding it.
+///
+/// `--per-bssid-time-max` is the ceiling a network may spend; a capture earns a share
+/// of it proportional to its unique-IV count -- a rich capture the full cap, a thinner
+/// one a smaller share. The result never exceeds the cap. A real corpus needed ~227s
+/// for a 4.5k-IV bias key and 40-415s for the WEP-104 keys -- reachable by raising the
+/// cap (e.g. `--per-bssid-time-max 1200`); the deep ladders only run where there are
+/// enough IVs to use the time (FR-PERF-3), so the scaling spends it only on networks
+/// rich enough. `None` (unlimited) stays unlimited.
+fn scale_budget(cap: Option<Duration>, unique_ivs: usize) -> Option<Duration> {
+    // Unique IVs at which a capture earns the full cap (a genuinely rich capture,
+    // 20x the WEP-40 feasibility floor); below it the budget is a proportional slice.
+    const RICH_IVS: u32 = 20_000;
+    cap.map(|c| {
+        let earned = u32::try_from(unique_ivs.min(RICH_IVS as usize)).unwrap_or(RICH_IVS);
+        (c / RICH_IVS).saturating_mul(earned)
+    })
+}
+
 /// Recover keys for every WEP BSSID, returning one `CrackResult` per crack.
 ///
-/// Three phases: the parallel cheap-attack *sweep* (FR-PERF-1), cross-BSSID key *reuse* (FR-PERF-2, so co-located same-key APs are cracked once), then the serialised brute *grind* bounded by `budget` per BSSID (FR-PERF-3). Each key streams to the progress surface as it verifies.
+/// Three phases: the parallel cheap-attack *sweep* (FR-PERF-1), cross-BSSID key *reuse* (FR-PERF-2, so co-located same-key APs are cracked once), then the serialised *brute force* -- bounded by `budget` per BSSID and by `brute_budget` over the whole phase (FR-PERF-3). Each key streams to the progress surface as it verifies.
 #[must_use]
 pub fn crack_all(
     bssids: &BTreeMap<Mac, BssidWep>,
     attacks: &[Box<dyn Attack>],
     lengths: &[KeyLen],
     budget: Option<Duration>,
+    recovery_budget: Option<Duration>,
+    brute_budget: Option<Duration>,
     seed_keys: &[WepKey],
     progress: &Progress,
+    debug: &DebugPrinter,
 ) -> CrackOutcome {
     let wep: Vec<&BssidWep> = bssids.values().filter(|b| b.encryption() == Encryption::Wep).collect();
     let sweep = progress.sweep_bar(wep.len() as u64);
@@ -203,7 +284,7 @@ pub fn crack_all(
     let mut cracked: HashSet<Mac> = HashSet::new();
     // The clock for every key's reported `seconds`: time from here, the start of
     // the attack phase, to when the key verifies (FR-OUT-2). It also splits the
-    // sweep and grind phase totals for the banner (`STATS.md`).
+    // recovery and brute-force phase totals for the banner (`STATS.md`).
     let phase_start = Instant::now();
 
     // Phase 0: seed keys (a potfile or prior cracks) -- report a known network
@@ -225,18 +306,31 @@ pub fn crack_all(
 
     // Phase 1: sweep -- each still-uncracked BSSID's cheap attacks run on the
     // pool, bounded by the per-BSSID `budget` (already resolved upstream: the
-    // default, an explicit `--time-budget`, or `None` for unlimited) so a hard
+    // default, an explicit `--per-bssid-time-max`, or `None` for unlimited) so a hard
     // network cannot starve the rest (FR-PERF-3).
+    // The whole recovery phase (this sweep) is bounded by `recovery_budget`
+    // (FR-PERF-3): once the deadline passes, networks not yet started are skipped, so
+    // a huge corpus cannot spin in the sweep even though each network is already capped.
+    let recovery_deadline = recovery_budget.and_then(|d| phase_start.checked_add(d));
     let swept: Vec<CrackResult> = wep
         .par_iter()
         .filter(|b| !cracked.contains(&b.bssid))
         .flat_map_iter(|b| {
+            // Stop starting new networks once the global recovery budget is spent.
+            if recovery_deadline.is_some_and(|dl| Instant::now() >= dl) {
+                sweep.inc(1);
+                return Vec::new();
+            }
             // Surface the network being worked, so a slow BSSID is visible (FR-UI-1).
             sweep.set_message(format!("attacking {}", b.bssid));
             // Crack each WEP key slot separately (FR-ATK-SLOT-1); crack() splits the
             // per-BSSID budget into a fair slice per attack (FR-PERF-3).
             let started = Instant::now();
-            let mut found = crack_slots(b, attacks, lengths, budget);
+            // Give this capture an IV-scaled share of the --per-bssid-time-max cap: a
+            // rich network earns the full cap, a marginal one a slice, never more than
+            // the cap (FR-PERF-3) -- so an explicit --per-bssid-time-max is a ceiling.
+            let b_budget = scale_budget(budget, super::unique_iv_count(b));
+            let mut found = crack_slots(b, attacks, lengths, b_budget, debug);
             // Stamp every slot with the time actually spent cracking this BSSID
             // (FR-OUT-2 `seconds`) -- per-BSSID granularity under the parallel sweep,
             // not phase-relative, so a fast crack reads fast even when it lands late.
@@ -271,19 +365,47 @@ pub fn crack_all(
             cracks.push(c);
         }
     }
-    // The cheap-attack sweep (seed + sweep + reuse) is everything up to here.
-    let sweep_elapsed = phase_start.elapsed();
+    // The recovery phase (seed + parallel attacks + reuse) is everything up to here.
+    let recovery_elapsed = phase_start.elapsed();
 
-    // Grind: the 40-bit brute, one BSSID at a time so two jobs never compete.
-    let grind_start = Instant::now();
+    // Brute force: the 40-bit search, one BSSID at a time so two jobs never compete.
+    // The whole phase is bounded by `brute_budget` (FR-PERF-3): each BSSID is already
+    // capped by `budget`, but on a big corpus many feasible WEP-40 networks searched
+    // in turn could still run for hours, so a global deadline stops the phase.
+    let brute_start = Instant::now();
+    let brute_deadline = brute_budget.and_then(|d| brute_start.checked_add(d));
     if attacks.iter().any(|a| a.is_grind()) && lengths.contains(&KeyLen::Wep40) {
         for b in &wep {
+            // Stop the whole phase once its global budget is spent, even mid-corpus.
+            if brute_deadline.is_some_and(|dl| Instant::now() >= dl) {
+                break;
+            }
             if cracked.contains(&b.bssid) || b.enc_frames().is_empty() {
                 continue;
             }
+            // Bound this BSSID by the smaller of its per-BSSID budget and the time
+            // left in the global brute budget, so the last network cannot overrun it.
+            let remaining = brute_deadline.map(|dl| dl.saturating_duration_since(Instant::now()));
+            let this_budget = match (budget, remaining) {
+                (Some(per), Some(left)) => Some(per.min(left)),
+                (per, None) => per,
+                (None, left) => left,
+            };
             let verifier = Verifier::new(b.enc_frames().to_vec());
+            if debug.enabled() {
+                debug.say(&format!("brute {}: start", b.bssid));
+            }
             let started = Instant::now();
-            if let Some(key) = grind(b.bssid, &verifier, budget, progress) {
+            let hit = grind(b.bssid, &verifier, this_budget, progress);
+            if debug.enabled() {
+                debug.say(&format!(
+                    "brute {}: {} in {:.3}s",
+                    b.bssid,
+                    if hit.is_some() { "recovered" } else { "no key" },
+                    started.elapsed().as_secs_f64()
+                ));
+            }
+            if let Some(key) = hit {
                 let mut c = result(b, key, "brute");
                 c.elapsed = started.elapsed();
                 sweep.println(&row(&c));
@@ -292,7 +414,7 @@ pub fn crack_all(
             }
         }
     }
-    CrackOutcome { cracks, sweep: sweep_elapsed, grind: grind_start.elapsed() }
+    CrackOutcome { cracks, recovery: recovery_elapsed, bruteforce: brute_start.elapsed() }
 }
 
 /// Brute the 40-bit space for one BSSID on the full pool, bounded by `budget`.
@@ -444,5 +566,30 @@ mod tests {
             Some(Duration::from_nanos(1)),
         );
         assert!(expired.lock().expect("lock").iter().all(|&p| p), "a near-zero budget arms an already-expired window");
+    }
+
+    #[test]
+    fn scale_budget_is_a_fraction_of_the_cap_never_exceeding_it() {
+        // FR-PERF-3: --per-bssid-time-max is the cap; the recovery budget is an
+        // IV-scaled share of it (a rich capture earns the full cap, a thinner one a
+        // smaller share) and never exceeds it. No floor -- a thin net gets a small
+        // slice (its deep ladders are gated off anyway; the cheap attacks finish fast).
+        use std::time::Duration;
+        let cap = Some(Duration::from_mins(1)); // 60s
+        assert_eq!(
+            super::scale_budget(cap, 500),
+            Some(Duration::from_millis(1500)),
+            "a thin net gets a small slice, no floor"
+        );
+        assert_eq!(super::scale_budget(cap, 1_000), Some(Duration::from_secs(3)), "the share scales with IVs");
+        assert_eq!(super::scale_budget(cap, 4_000), Some(Duration::from_secs(12)), "more IVs, more of the cap");
+        assert_eq!(super::scale_budget(cap, 20_000), cap, "a rich capture earns the full cap");
+        assert_eq!(super::scale_budget(cap, 1_000_000), cap, "and never more than the cap");
+        assert_eq!(
+            super::scale_budget(Some(Duration::from_mins(10)), 4_000),
+            Some(Duration::from_mins(2)),
+            "a larger cap gives a network proportionally more"
+        );
+        assert_eq!(super::scale_budget(None, 100_000), None, "unlimited stays unlimited");
     }
 }

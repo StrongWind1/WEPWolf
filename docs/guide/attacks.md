@@ -46,7 +46,7 @@ If the capture contains a WEP Shared-Key authentication exchange, WEPWolf pairs 
 
 ## Brute force
 
-As a last resort, `--brute` enables an exhaustive search of the entire **WEP-40** key space (2⁴⁰). It is off by default because it is slow, and it applies only to WEP-40 -- 2¹⁰⁴ is infeasible, so longer keys are recovered statistically or by keygen/dictionary, never brute-forced. WEPWolf's brute is not naive: it runs a SIMD-batched known-plaintext prefilter that rejects almost every candidate on its first few keystream octets, so the full decrypt-and-verify runs only for the rare survivor. The 40-bit grind runs one network at a time on the whole machine, bounded by `--time-budget`, with microsecond cancellation once a key is found.
+As a last resort, `--brute` enables an exhaustive search of the entire **WEP-40** key space (2⁴⁰). It is off by default because it is slow, and it applies only to WEP-40 -- 2¹⁰⁴ is infeasible, so longer keys are recovered statistically or by keygen/dictionary, never brute-forced. WEPWolf's brute is not naive: it runs a SIMD-batched known-plaintext prefilter that rejects almost every candidate on its first few keystream octets, so the full decrypt-and-verify runs only for the rare survivor. The 40-bit grind runs one network at a time on the whole machine, bounded by `--per-bssid-time-max` (and by `--total-brute-time-max` over the whole phase), with microsecond cancellation once a key is found.
 
 ## How the attacks are scheduled
 

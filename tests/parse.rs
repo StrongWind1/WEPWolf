@@ -285,8 +285,11 @@ fn dictionary_attack_recovers_key() {
         &attacks,
         &wepwolf::model::KeyLen::all(),
         None,
+        None,
+        None,
         &[],
         &wepwolf::progress::Progress::new(false),
+        &DebugPrinter::new(false),
     )
     .cracks;
     assert_eq!(cracks.len(), 1, "exactly one key recovered");

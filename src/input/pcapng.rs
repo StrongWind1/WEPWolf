@@ -130,6 +130,20 @@ fn read_array<const N: usize>(buf: &[u8], offset: usize, context: &'static str) 
     })
 }
 
+/// Coalesce a parser warning into `warnings`: bump an identical earlier entry's
+/// count, or append a new one. A desynchronised pcapng stream trips the same
+/// warning on every remaining block, so coalescing folds millions of repeats into
+/// one `(reason, count)` entry the scan later replays as a single `count=N` log
+/// line -- instead of a `println!` per block flooding stdout (FR-DEBUG-4). Reasons
+/// are fixed strings (no per-occurrence numbers) so the distinct set stays tiny.
+fn push_warn(warnings: &mut Vec<(String, u64)>, reason: &str) {
+    if let Some(entry) = warnings.iter_mut().find(|(seen, _)| seen == reason) {
+        entry.1 += 1;
+    } else {
+        warnings.push((reason.to_owned(), 1));
+    }
+}
+
 // --- Reader ---
 
 /// Streaming pcapng reader. Maintains one reusable body buffer to avoid per-block allocation.
@@ -150,6 +164,10 @@ pub struct PcapngReader<R: Read> {
     version: (u16, u16),
     /// Recycled packet-data buffer returned by the caller via `recycle_buffer`.
     pkt_buf: Vec<u8>,
+    /// Parser warnings coalesced over this file (reason -> count), drained by the
+    /// scan into the per-file log tally so a desynchronised stream cannot flood
+    /// stdout (FR-DEBUG-4). See [`PacketReader::take_warnings`].
+    warnings: Vec<(String, u64)>,
 }
 
 impl<R: Read> std::fmt::Debug for PcapngReader<R> {
@@ -190,11 +208,13 @@ impl<R: Read> PcapngReader<R> {
         // BOM is at bytes 8..12 (the very start of the SHB body).
         // [draft-ietf-opsawg-pcapng-05] §4.1
         let bom_bytes: [u8; 4] = read_array(&prefix, 8, "pcapng SHB BOM")?;
+        // Coalesced parser warnings for this file, drained by the scan (FR-DEBUG-4).
+        let mut warnings: Vec<(String, u64)> = Vec::new();
         let byte_order = match bom_bytes {
             BOM_LITTLE_ENDIAN => ByteOrder::Little,
             BOM_BIG_ENDIAN => ByteOrder::Big,
             _ => {
-                println!("wpawolf: pcapng SHB BOM unrecognised ({bom_bytes:02X?}), assuming little-endian");
+                push_warn(&mut warnings, "pcapng SHB byte-order magic unrecognised, assuming little-endian");
                 ByteOrder::Little
             },
         };
@@ -251,11 +271,24 @@ impl<R: Read> PcapngReader<R> {
         // [draft-ietf-opsawg-pcapng-05] §4.1
         let major = byte_order.u16(read_array(&block_buf, 4, "pcapng SHB major version")?);
         if major != SHB_MAJOR_VERSION {
-            println!("wpawolf: pcapng SHB major version {major} != {SHB_MAJOR_VERSION}, continuing anyway");
+            push_warn(&mut warnings, "pcapng SHB major version unsupported, continuing");
         }
         let minor = byte_order.u16(read_array(&block_buf, 6, "pcapng SHB minor version")?);
 
-        Ok(Self { reader, byte_order, interfaces: Vec::new(), block_buf, version: (major, minor), pkt_buf: Vec::new() })
+        Ok(Self {
+            reader,
+            byte_order,
+            interfaces: Vec::new(),
+            block_buf,
+            version: (major, minor),
+            pkt_buf: Vec::new(),
+            warnings,
+        })
+    }
+
+    /// Record one coalesced parser warning for this file (see [`push_warn`]).
+    fn warn(&mut self, reason: &str) {
+        push_warn(&mut self.warnings, reason);
     }
 
     // --- Block reading ---
@@ -294,9 +327,9 @@ impl<R: Read> PcapngReader<R> {
         let block_total_len = self.byte_order.u32(read_array(&hdr, 4, "pcapng block total length")?);
 
         if block_total_len < MIN_BLOCK_BYTES {
-            println!(
-                "wpawolf: pcapng block type 0x{block_type:08X} has block_total_length {block_total_len} < {MIN_BLOCK_BYTES}, skipping (stream desynchronized -- remaining blocks in this section may fail)"
-            );
+            // A desynchronised stream trips this on every remaining block; coalesce
+            // it (FR-DEBUG-4) instead of printing one line per block.
+            self.warn("pcapng block_total_length below the 12-byte minimum, skipping (stream desynchronized)");
             return Ok(BlockOutcome::Skip);
         }
 
@@ -358,7 +391,7 @@ impl<R: Read> PcapngReader<R> {
                 // Read EPB fixed-header fields directly from block_buf to avoid
                 // cloning the entire body. Only the packet data is copied out.
                 if body_len < EPB_HEADER_LEN {
-                    println!("wpawolf: pcapng EPB body too short ({body_len} bytes, need {EPB_HEADER_LEN}), skipping");
+                    self.warn("pcapng EPB body too short, skipping");
                     return Ok(BlockOutcome::Skip);
                 }
                 let interface_id = self.byte_order.u32(read_array(&self.block_buf, 0, "pcapng EPB interface_id")?);
@@ -417,9 +450,7 @@ impl<R: Read> PcapngReader<R> {
     fn parse_shb_body(&mut self, body_len: usize) -> Result<()> {
         if body_len < SHB_BODY_MIN {
             // Truncated SHB: reset state and continue.
-            println!(
-                "wpawolf: pcapng SHB body too short ({body_len} bytes, need {SHB_BODY_MIN}), resetting interfaces"
-            );
+            self.warn("pcapng SHB body too short, resetting interfaces");
             self.interfaces.clear();
             return Ok(());
         }
@@ -431,7 +462,7 @@ impl<R: Read> PcapngReader<R> {
             BOM_LITTLE_ENDIAN => ByteOrder::Little,
             BOM_BIG_ENDIAN => ByteOrder::Big,
             _ => {
-                println!("wpawolf: pcapng SHB BOM unrecognised ({bom_bytes:02X?}), keeping current byte order");
+                self.warn("pcapng SHB byte-order magic unrecognised, keeping current byte order");
                 self.byte_order
             },
         };
@@ -440,7 +471,7 @@ impl<R: Read> PcapngReader<R> {
         // [draft-ietf-opsawg-pcapng-05] §4.1
         let major = self.byte_order.u16(read_array(&self.block_buf, 4, "pcapng SHB major version")?);
         if major != SHB_MAJOR_VERSION {
-            println!("wpawolf: pcapng SHB major version {major} != {SHB_MAJOR_VERSION}, continuing anyway");
+            self.warn("pcapng SHB major version unsupported, continuing");
         }
         let minor = self.byte_order.u16(read_array(&self.block_buf, 6, "pcapng SHB minor version")?);
         self.version = (major, minor);
@@ -461,10 +492,7 @@ impl<R: Read> PcapngReader<R> {
     /// [draft-ietf-opsawg-pcapng-05] §4.2
     fn parse_idb_body(&mut self, body: &[u8]) -> Result<()> {
         if body.len() < IDB_BODY_MIN {
-            println!(
-                "wpawolf: pcapng IDB body too short ({} bytes, need {IDB_BODY_MIN}), skipping interface",
-                body.len()
-            );
+            self.warn("pcapng IDB body too short, skipping interface");
             return Ok(());
         }
 
@@ -571,6 +599,10 @@ impl<R: Read> PacketReader for PcapngReader<R> {
         if buf.capacity() > self.pkt_buf.capacity() {
             self.pkt_buf = buf;
         }
+    }
+
+    fn take_warnings(&mut self) -> Vec<(String, u64)> {
+        std::mem::take(&mut self.warnings)
     }
 
     /// Returns the DLT for the given interface index, or `None` if not yet registered.

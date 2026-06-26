@@ -84,10 +84,16 @@ pub struct Stats {
     pub peak_rss_bytes: u64,
     /// Total wallclock time.
     pub wallclock: Duration,
-    /// Time in the parallel cheap-attack sweep.
-    pub sweep: Duration,
-    /// Time in the sequential 40-bit grind.
-    pub grind: Duration,
+    /// Time discovering capture files (directory walk + parallel magic filter).
+    pub discovery: Duration,
+    /// Time ingesting captures (parse + classify + per-file merge).
+    pub ingest: Duration,
+    /// Time in the key-recovery phase -- the parallel PTW/KoreK/FMS/bias/dictionary/
+    /// keygen/SKA attacks plus cross-BSSID reuse, run across all cores (everything
+    /// except the 40-bit brute force).
+    pub recovery: Duration,
+    /// Time in the sequential 40-bit brute-force search.
+    pub bruteforce: Duration,
 }
 
 impl Stats {

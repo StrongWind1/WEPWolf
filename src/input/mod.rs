@@ -147,6 +147,19 @@ pub trait PacketReader {
     /// alive and reuse it for the next read. Readers that do not override this
     /// method simply drop the buffer (no-op default).
     fn recycle_buffer(&mut self, _buf: Vec<u8>) {}
+
+    /// Drains diagnostic warnings the reader coalesced while parsing this file, as
+    /// `(reason, count)` pairs in first-seen order.
+    ///
+    /// A corrupt or desynchronised stream can trip the same parser warning on
+    /// millions of blocks. Rather than print each one -- which floods stdout and
+    /// can corrupt the `--plain` / `--json` surfaces -- a reader accumulates a
+    /// coalesced count, and the scan drains it here into the per-file
+    /// [`crate::diag::EventTally`] so it replays as a single `count=N` line in
+    /// `--log` (FR-DEBUG-4). Default: no warnings.
+    fn take_warnings(&mut self) -> Vec<(String, u64)> {
+        Vec::new()
+    }
 }
 
 // --- Format detection and dispatch ---
@@ -310,7 +323,7 @@ fn collect_candidate_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) -> Res
         let entry = match entry {
             Ok(e) => e,
             Err(e) => {
-                println!("warning: cannot read entry in {}: {e}", dir.display());
+                eprintln!("wepwolf: cannot read entry in {}: {e}", dir.display());
                 continue;
             },
         };
@@ -319,7 +332,7 @@ fn collect_candidate_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) -> Res
         let ft = match entry.file_type() {
             Ok(t) => t,
             Err(e) => {
-                println!("warning: cannot stat {}: {e}", path.display());
+                eprintln!("wepwolf: cannot stat {}: {e}", path.display());
                 continue;
             },
         };
@@ -365,7 +378,7 @@ pub fn expand_inputs(inputs: &[std::path::PathBuf]) -> Result<Vec<std::path::Pat
         let meta = match std::fs::metadata(path) {
             Ok(m) => m,
             Err(e) => {
-                println!("warning: cannot stat {}: {e}", path.display());
+                eprintln!("wepwolf: cannot stat {}: {e}", path.display());
                 continue;
             },
         };

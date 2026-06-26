@@ -107,8 +107,18 @@ fn cross_bssid_key_reuse() {
     map.insert(b.bssid, b);
 
     let attacks: Vec<Box<dyn Attack>> = vec![Box::new(PtwAttack::default())];
-    let cracks =
-        attack::crack_all(&map, &attacks, &[KeyLen::Wep40], None, &[], &wepwolf::progress::Progress::new(false)).cracks;
+    let cracks = attack::crack_all(
+        &map,
+        &attacks,
+        &[KeyLen::Wep40],
+        None,
+        None,
+        None,
+        &[],
+        &wepwolf::progress::Progress::new(false),
+        &wepwolf::diag::DebugPrinter::new(false),
+    )
+    .cracks;
     assert_eq!(cracks.len(), 2, "both BSSIDs end up cracked");
     assert!(cracks.iter().any(|c| c.attack == "reuse"), "the thin BSSID is cracked via reuse");
 }
@@ -160,8 +170,18 @@ fn ska_handshake_network_is_credited_to_ska() {
     map.insert(with_ska.bssid, with_ska);
     map.insert(no_ska.bssid, no_ska);
     let attacks: Vec<Box<dyn Attack>> = vec![Box::new(SkaAttack::default()), Box::new(PtwAttack::default())];
-    let cracks =
-        attack::crack_all(&map, &attacks, &[KeyLen::Wep40], None, &[], &wepwolf::progress::Progress::new(false)).cracks;
+    let cracks = attack::crack_all(
+        &map,
+        &attacks,
+        &[KeyLen::Wep40],
+        None,
+        None,
+        None,
+        &[],
+        &wepwolf::progress::Progress::new(false),
+        &wepwolf::diag::DebugPrinter::new(false),
+    )
+    .cracks;
     let via: HashMap<Mac, &str> = cracks.iter().map(|c| (c.bssid, c.attack)).collect();
     assert_eq!(via.get(&Mac::from_bytes([0x0e; 6])).copied(), Some("ska"), "handshake network is credited to SKA");
     assert_eq!(via.get(&Mac::from_bytes([0x0f; 6])).copied(), Some("ptw"), "no-handshake network falls through to PTW");
@@ -178,9 +198,9 @@ fn rejects_16_byte_key() {
 }
 
 #[test]
-fn time_budget_bounds_the_grind() {
-    // FR-PERF-3: a zero budget stops the brute before it can find even a
-    // low-index key; with no budget the same key is recovered via the grind.
+fn per_bssid_time_max_bounds_the_brute_force() {
+    // FR-PERF-3: a zero per-BSSID budget stops the brute before it can find even a
+    // low-index key; with no budget the same key is recovered via the brute force.
     use std::collections::BTreeMap;
     use std::time::Duration;
     use wepwolf::attack::{self, brute::BruteAttack};
@@ -210,11 +230,99 @@ fn time_budget_bounds_the_grind() {
     let attacks: Vec<Box<dyn Attack>> = vec![Box::new(BruteAttack)];
     let prog = Progress::new(false);
 
-    let cracked = attack::crack_all(&map, &attacks, &[KeyLen::Wep40], None, &[], &prog).cracks;
+    let cracked = attack::crack_all(
+        &map,
+        &attacks,
+        &[KeyLen::Wep40],
+        None,
+        None,
+        None,
+        &[],
+        &prog,
+        &wepwolf::diag::DebugPrinter::new(false),
+    )
+    .cracks;
     assert!(cracked.iter().any(|c| c.attack == "brute"), "no budget -> brute finds the low key");
 
-    let bounded = attack::crack_all(&map, &attacks, &[KeyLen::Wep40], Some(Duration::ZERO), &[], &prog).cracks;
-    assert!(bounded.is_empty(), "zero budget -> grind bails before finding it");
+    let bounded = attack::crack_all(
+        &map,
+        &attacks,
+        &[KeyLen::Wep40],
+        Some(Duration::ZERO),
+        None,
+        None,
+        &[],
+        &prog,
+        &wepwolf::diag::DebugPrinter::new(false),
+    )
+    .cracks;
+    assert!(bounded.is_empty(), "zero budget -> brute force bails before finding it");
+}
+
+#[test]
+fn total_brute_time_max_bounds_the_whole_brute_force() {
+    // FR-PERF-3: a global --total-brute-time-max stops the brute-force phase across
+    // BSSIDs. Even with an unbounded per-BSSID budget, a zero TOTAL brute budget bails
+    // before the phase brute-forces a low-index key an unbounded run recovers.
+    use std::collections::BTreeMap;
+    use std::time::Duration;
+    use wepwolf::attack::{self, brute::BruteAttack};
+    use wepwolf::model::Mac;
+    use wepwolf::progress::Progress;
+
+    let key = [0x03u8, 0, 0, 0, 0]; // low index -> quick to brute when allowed
+    let enc: Vec<EncFrame> = [[2u8, 4, 6], [1, 3, 5]]
+        .iter()
+        .map(|iv| {
+            let plain = b"\xaa\xaa\x03\x00\x00\x00 grind frame body";
+            let mut data = plain.to_vec();
+            data.extend_from_slice(&crc32(plain).to_le_bytes());
+            let mut seed = iv.to_vec();
+            seed.extend_from_slice(&key);
+            Rc4::new(&seed).apply_keystream(&mut data);
+            EncFrame { iv: *iv, data, key_id: 0 }
+        })
+        .collect();
+    let b = BssidWep {
+        bssid: Mac::from_bytes([0x0c; 6]),
+        saw_wep_data: true,
+        ..BssidWep::with_material(WepMaterial { enc_frames: enc, ..Default::default() })
+    };
+    let mut map = BTreeMap::new();
+    map.insert(b.bssid, b);
+    let attacks: Vec<Box<dyn Attack>> = vec![Box::new(BruteAttack)];
+    let prog = Progress::new(false);
+
+    // No global cap (and no per-BSSID cap): the brute force recovers the low-index key.
+    let found = attack::crack_all(
+        &map,
+        &attacks,
+        &[KeyLen::Wep40],
+        None,
+        None,
+        None,
+        &[],
+        &prog,
+        &wepwolf::diag::DebugPrinter::new(false),
+    )
+    .cracks;
+    assert!(found.iter().any(|c| c.attack == "brute"), "no brute budget -> brute finds the low key");
+
+    // A zero TOTAL brute budget stops the phase before brute-forcing anything, even
+    // though the per-BSSID budget is unbounded.
+    let bounded = attack::crack_all(
+        &map,
+        &attacks,
+        &[KeyLen::Wep40],
+        None,
+        None,
+        Some(Duration::ZERO),
+        &[],
+        &prog,
+        &wepwolf::diag::DebugPrinter::new(false),
+    )
+    .cracks;
+    assert!(bounded.is_empty(), "zero global brute budget -> brute-force phase bails");
 }
 
 #[test]
@@ -295,8 +403,18 @@ fn cracks_each_key_slot_independently() {
     map.insert(b.bssid, b);
 
     let attacks: Vec<Box<dyn Attack>> = vec![Box::new(PtwAttack::default())];
-    let cracks =
-        attack::crack_all(&map, &attacks, &[KeyLen::Wep40], None, &[], &wepwolf::progress::Progress::new(false)).cracks;
+    let cracks = attack::crack_all(
+        &map,
+        &attacks,
+        &[KeyLen::Wep40],
+        None,
+        None,
+        None,
+        &[],
+        &wepwolf::progress::Progress::new(false),
+        &wepwolf::diag::DebugPrinter::new(false),
+    )
+    .cracks;
     let recovered: HashMap<u8, Vec<u8>> = cracks.iter().map(|c| (c.key_id, c.key.as_slice().to_vec())).collect();
     assert_eq!(recovered.get(&0).map(Vec::as_slice), Some(key0.as_slice()), "slot 0 key recovered");
     assert_eq!(recovered.get(&1).map(Vec::as_slice), Some(key1.as_slice()), "slot 1 key recovered");
@@ -304,22 +422,96 @@ fn cracks_each_key_slot_independently() {
 
 #[test]
 fn feasibility_gates_on_unique_ivs_not_raw_frames() {
-    // FR-OUT-5: the feasibility gate counts distinct IVs, not raw frames -- a
-    // capture that replays one packet is frame-rich but IV-poor and cannot converge,
-    // so attacking it only burns the per-BSSID budget.
-    let count = 1500u32; // above min_samples(Wep40) = 1000
-    // Many frames, one IV: too little unique material -> attack not applicable.
+    // Unique IVs, not raw frames, decide whether an attack is attempted: a capture
+    // replaying one packet (1 unique IV, many frames) has no statistical material and
+    // is skipped, while a thin-but-real capture is attempted anyway -- the "thin"
+    // label (< 1000 IVs) is a report outcome, not an attack gate (FR-OUT-5).
+    // Many frames, ONE IV: degenerate, nothing to vote on -> not attempted.
     let replayed = BssidWep::with_material(WepMaterial {
-        ivs: (0..count).map(|_| IvSample::new([1, 2, 3], &[0u8; 8])).collect(),
+        ivs: (0..1500u32).map(|_| IvSample::new([1, 2, 3], &[0u8; 8])).collect(),
         ..Default::default()
     });
-    assert!(!PtwAttack::default().applicable(&replayed, KeyLen::Wep40), "one IV replayed many times is not feasible");
-    // Same frame count, distinct IVs: feasible.
-    let varied = BssidWep::with_material(WepMaterial {
-        ivs: (0..count).map(|c| IvSample::new([c as u8, (c >> 8) as u8, 0], &[0u8; 8])).collect(),
+    assert!(!PtwAttack::default().applicable(&replayed, KeyLen::Wep40), "one IV replayed is not attempted");
+    // A thin capture, far below the 1000-IV 'thin' floor, is attempted at WEP-40.
+    let thin = BssidWep::with_material(WepMaterial {
+        ivs: (0..100u32).map(|c| IvSample::new([c as u8, 0, 0], &[0u8; 8])).collect(),
         ..Default::default()
     });
-    assert!(PtwAttack::default().applicable(&varied, KeyLen::Wep40), "enough distinct IVs is feasible");
+    assert!(PtwAttack::default().applicable(&thin, KeyLen::Wep40), "a thin but real capture is attempted");
+    // WEP-104 keeps its higher convergence floor -- not attempted on a thin capture.
+    assert!(!PtwAttack::default().applicable(&thin, KeyLen::Wep104), "WEP-104 still needs its IV floor");
+}
+
+#[test]
+fn built_in_common_keys_crack_a_default_key_with_no_wordlist() {
+    // FR-ATK-DICT-1: the shipped common/weak-key list is tried as a dictionary even
+    // without --wordlist, so a default-key network (here the hex 12:34:56:78:90 that
+    // dominates real captures) cracks for free -- the path that lets a thin net with a
+    // default key crack now that every network is attempted.
+    use wepwolf::attack::dict::{COMMON_KEYS, DictAttack};
+    let key = [0x12u8, 0x34, 0x56, 0x78, 0x90]; // "1234567890" hex-typed default
+    let words: Vec<Vec<u8>> = COMMON_KEYS.iter().map(|k| k.as_bytes().to_vec()).collect();
+    let dict = DictAttack::from_words(words);
+    let recovered = dict.run(&BssidWep::default(), KeyLen::Wep40, &verifier_for(&key));
+    assert_eq!(
+        recovered.as_ref().map(WepKey::as_slice),
+        Some(key.as_slice()),
+        "the built-in list recovers the common default key with no wordlist"
+    );
+}
+
+#[test]
+fn deep_ladders_declare_convergence_need() {
+    // FR-PERF-3: the backtracking ladders (PTW/KoreK/bias) are convergence-bound, so
+    // the engine runs their deep pass only where there are enough unique IVs; the
+    // cheap direct attacks (FMS, dictionary, keygen, SKA) run on every network.
+    assert!(PtwAttack::default().needs_convergence(), "PTW runs a deep ladder");
+    assert!(BiasAttack::default().needs_convergence(), "bias runs a deep ladder");
+    assert!(!FmsAttack.needs_convergence(), "FMS is a cheap direct attack");
+}
+
+#[test]
+fn total_recovery_time_max_bounds_the_recovery_phase() {
+    // FR-PERF-3: a global --total-recovery-time-max caps the parallel sweep across BSSIDs. A
+    // zero budget skips the sweep entirely (no fresh statistical cracking), even for a
+    // network PTW would otherwise recover; an unbounded budget recovers it.
+    use std::collections::BTreeMap;
+    use std::time::Duration;
+    use wepwolf::attack::{self, ptw::PtwAttack};
+    use wepwolf::model::Mac;
+    use wepwolf::progress::Progress;
+
+    let key = [0x2bu8, 0x7e, 0x15, 0x16, 0x28];
+    let arp = (0..80_000u32).map(|c| keystream([c as u8, (c >> 8) as u8, (c >> 16) as u8], &key, 16)).collect();
+    let enc: Vec<EncFrame> = [[9u8, 9, 9], [8, 8, 8]]
+        .iter()
+        .map(|iv| {
+            let plain = b"\xaa\xaa\x03\x00\x00\x00 recovery budget frame";
+            let mut data = plain.to_vec();
+            data.extend_from_slice(&crc32(plain).to_le_bytes());
+            let mut seed = iv.to_vec();
+            seed.extend_from_slice(&key);
+            Rc4::new(&seed).apply_keystream(&mut data);
+            EncFrame { iv: *iv, data, key_id: 0 }
+        })
+        .collect();
+    let b = BssidWep {
+        bssid: Mac::from_bytes([0x0a; 6]),
+        saw_wep_data: true,
+        ..BssidWep::with_material(WepMaterial { arp_keystreams: arp, enc_frames: enc, ..Default::default() })
+    };
+    let mut map = BTreeMap::new();
+    map.insert(b.bssid, b);
+    let attacks: Vec<Box<dyn Attack>> = vec![Box::new(PtwAttack::default())];
+    let prog = Progress::new(false);
+    let dbg = wepwolf::diag::DebugPrinter::new(false);
+
+    let found = attack::crack_all(&map, &attacks, &[KeyLen::Wep40], None, None, None, &[], &prog, &dbg).cracks;
+    assert!(found.iter().any(|c| c.attack == "ptw"), "no recovery budget -> PTW recovers the key");
+
+    let bounded =
+        attack::crack_all(&map, &attacks, &[KeyLen::Wep40], None, Some(Duration::ZERO), None, &[], &prog, &dbg).cracks;
+    assert!(bounded.is_empty(), "zero recovery budget -> the sweep is skipped, nothing recovered");
 }
 
 #[test]

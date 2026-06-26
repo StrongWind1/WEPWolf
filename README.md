@@ -107,12 +107,14 @@ Targeting & attacks:
 
 Search tuning:
   -f, --fudge <FACTOR>  KoreK/bias fudge factor: keep octets voting >= top/FACTOR (aircrack -f)
-  -x, --bruteforce <N>  Exhaustively sweep the last N key octets (aircrack -x; default 1, max 4)
+  -x, --bruteforce <N>  Exhaustively sweep the last N key octets (aircrack -x; default 2, max 4)
   -c, --alnum           Restrict candidate key octets to printable ASCII (aircrack -c)
 
 Performance:
-  -j, --threads <N>         Worker threads for the parallel sweep and ingest (default: all cores)
-      --time-budget <SECS>  Per-BSSID time budget in seconds for the sweep and brute
+  -j, --threads <N>                     Worker threads for the parallel sweep and ingest (default: all cores)
+      --per-bssid-time-max <SECS>       Max seconds any one network may spend in recovery and brute force (default 300)
+      --total-brute-time-max <SECS>     Max total seconds for the whole 40-bit brute-force phase (default 0: unlimited)
+      --total-recovery-time-max <SECS>  Max total seconds for the whole recovery phase (default 0: unlimited)
 
 Output:
       --plain           Tab-separated records, tagged key / wep / stat (machine-readable)

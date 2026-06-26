@@ -4,6 +4,25 @@ All notable changes to WEPWolf are documented here. The format follows [Keep a C
 
 ## [Unreleased]
 
+### Added
+
+- A built-in list of common/weak WEP keys is now tried as a dictionary on every network, no `--wordlist` required -- the recurring defaults and patterns from real captures (the hex `1234567890` and ASCII `12345` lead). The check runs in the cheap quick pass, so a default-key network -- including a thin one statistics cannot touch -- cracks for free before any expensive ladder; a `--wordlist`, when given, is merged in.
+- `--total-recovery-time-max`: a total wall-clock cap (seconds) for the whole parallel recovery sweep across all networks (default `0` = unlimited) -- the recovery-phase analogue of `--total-brute-time-max`, so attempting every network stays bounded on a huge corpus (once spent, networks not yet started are skipped).
+- `--total-brute-time-max`: a total wall-clock cap (seconds) for the whole 40-bit brute-force search across all networks (default `0` = unlimited). Each network was already bounded by `--per-bssid-time-max`, but on a large corpus with `--brute` the many feasible WEP-40 networks searched in turn could still run for hours; this caps the phase total.
+- Per-phase timing in the closing banner: the `run` section breaks `wallclock` into `discovery`, `ingest`, `recovery`, and `brute force` rows (with `discovery_s` / `ingest_s` on the `--plain` and `--json` surfaces), so a large multi-file run shows at a glance that most of its time is discovery and ingest, not cracking.
+
+### Changed
+
+- The closing banner and machine surfaces name the two crack phases plainly -- `recovery` (the parallel PTW/KoreK/FMS/bias/dictionary/keygen/SKA attacks plus reuse) and `brute force` (the 40-bit exhaustive search) -- replacing the internal `sweep` / `grind` labels (`recovery_s` / `bruteforce_s` in `--plain` / `--json`).
+- The per-BSSID time cap is now `--per-bssid-time-max` (renamed from `--time-budget`) and defaults to 300 seconds, bounding the recovery phase and the brute force alike (`0` = unlimited); the two total-phase caps are `--total-recovery-time-max` and `--total-brute-time-max`. The per-network recovery budget is an IV-scaled fraction of the cap -- a rich capture earns the full cap, a thinner one a smaller share, never more than the cap. The old 10 s floor is removed: a thin network's deep ladders are gated off anyway, so its cheap attacks (dictionary, common keys, reuse) just run instantly rather than holding a minimum slice. The last-keybyte bruteforce default (`-x` / `--bruteforce`) is raised from 1 to 2. Raise `--per-bssid-time-max` (e.g. to 1200) to give the deep WEP-104 ladders the minutes they need on rich captures.
+- Every WEP network with real IV material is now attempted, instead of being pre-skipped below the 1000-IV floor; that floor is now only the "capture too thin" report label for an *uncracked* network, so a weak or default key on a thin capture is no longer missed by a pre-filter. WEP-104/232 keep their higher convergence floors (too few IVs cannot converge), and a degenerate single-IV capture (one packet replayed) is still skipped by the statistical attacks -- cross-BSSID reuse and the potfile still try it.
+- The expensive backtracking ladders (PTW/KoreK/bias) run their deep (full) pass only where there are enough unique IVs to converge; the cheap quick pass and the dictionary/common-key checks still run on every network. So a thin network gets a genuine shot (a default/weak/reused key) without burning its per-BSSID budget on a hopeless deep search -- which had made the recovery phase, and the test suite, far slower.
+- Parser warnings (a desynchronised pcapng stream, a short or odd block) are coalesced per file and routed through the `--log` sink as a single `count=N` line instead of one line per block. A single corrupt capture could previously print millions of lines to stdout, bloating the console and corrupting the `--plain` / `--json` surfaces; directory-walk warnings likewise moved to stderr.
+
+### Fixed
+
+- Parser diagnostics carried a stale `wpawolf:` prefix from the ported front-end; they are now categorized `--log` lines without it.
+
 ## [1.0.0] - 2026-06-17
 
 ### Added

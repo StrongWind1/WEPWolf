@@ -43,7 +43,7 @@ fn wep_bssid(essid: &[u8]) -> BssidWep {
 }
 
 /// A one-BSSID scan result with a single recovered key in the accounting and the
-/// timing fields stamped, so the banner's wallclock/sweep rows render.
+/// timing fields stamped, so the banner's wallclock/recovery rows render.
 fn result_with(essid: &[u8]) -> ScanResult {
     let mut bssids = BTreeMap::new();
     bssids.insert(Mac::from_bytes(BSSID), wep_bssid(essid));
@@ -54,7 +54,7 @@ fn result_with(essid: &[u8]) -> ScanResult {
         wep_bssids: 1,
         cracked: 1,
         wallclock: Duration::from_millis(150),
-        sweep: Duration::from_millis(150),
+        recovery: Duration::from_millis(150),
         ..Default::default()
     };
     ScanResult { bssids, stats }

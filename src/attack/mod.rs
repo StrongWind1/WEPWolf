@@ -62,12 +62,14 @@ pub mod ska;
 
 pub use engine::{CrackOutcome, CrackResult, crack, crack_all};
 
-/// The minimum IV/keystream samples a statistical attack needs at a key length.
+/// The unique-IV convergence floor per key length.
 ///
-/// Below it the votes are pure noise, so the attack is skipped and the BSSID
-/// reported as "capture too thin" (FR-OUT-5) rather than spun on. These are
-/// feasibility floors, not acceptance thresholds: the `Verifier` (C4) remains
-/// the only thing that declares a key.
+/// WEP-104/232 are not attempted below it (too few IVs to ever converge), and it is
+/// the threshold below which an *uncracked* WEP-40 network is reported "capture too
+/// thin" (FR-OUT-5). It is no longer a WEP-40 attack gate -- every network with real
+/// IV material is attempted (see [`worth_attempting`]), so a weak or default key is
+/// never pre-skipped; for WEP-40 the floor only labels the result. Not an acceptance
+/// threshold: the `Verifier` (C4) remains the only thing that declares a key.
 #[must_use]
 pub const fn min_samples(len: KeyLen) -> usize {
     match len {
@@ -93,6 +95,25 @@ pub(crate) fn unique_iv_count(bssid: &BssidWep) -> usize {
         seen.insert(sample.iv);
     }
     seen.len()
+}
+
+/// Whether a statistical attack is worth attempting on `bssid` at `len`.
+///
+/// Every network with real IV material is attempted at WEP-40, so a weak/default key
+/// or a lucky low-IV crack is never pre-skipped -- the "thin" label (below the
+/// 1000-IV WEP-40 floor) is a *reporting* outcome, not an attack gate (FR-OUT-5). The
+/// longer keys keep the higher convergence floor: WEP-104/232 cannot converge from a
+/// handful of IVs, so attempting them there only burns the budget. A capture
+/// replaying one packet (a single distinct IV) has no statistical material and is
+/// skipped at every length -- cross-BSSID reuse and the potfile still try it.
+pub(crate) fn worth_attempting(bssid: &BssidWep, len: KeyLen) -> bool {
+    // A statistical vote needs at least two distinct IVs to vary at all.
+    const MIN_ATTEMPT_IVS: usize = 2;
+    let ivs = unique_iv_count(bssid);
+    match len {
+        KeyLen::Wep40 => ivs >= MIN_ATTEMPT_IVS,
+        KeyLen::Wep104 | KeyLen::Wep232 => ivs >= min_samples(len),
+    }
 }
 
 /// Deduplicate samples by IV, keeping the longest keystream per IV.
@@ -211,6 +232,16 @@ pub trait Attack: Send + Sync {
     /// BSSID at a time on the full pool, rather than in the parallel sweep
     /// (FR-PERF-1). Cheap statistical/dictionary attacks leave this `false`.
     fn is_grind(&self) -> bool {
+        false
+    }
+
+    /// Whether this attack runs an expensive backtracking search that converges only
+    /// with enough unique IVs. The engine runs such an attack's deep (full) pass only
+    /// at or above [`min_samples`] -- a thin network still gets the cheap quick pass
+    /// and the dictionary/common-key checks, but its budget is not burned on a
+    /// hopeless ladder (FR-PERF-3). Cheap or material-bootstrapped attacks
+    /// (FMS, dictionary, keygen, SKA) leave this `false`.
+    fn needs_convergence(&self) -> bool {
         false
     }
 }

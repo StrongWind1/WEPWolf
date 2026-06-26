@@ -225,6 +225,15 @@ fn scan_file(
         }
         reader.recycle_buffer(packet.data);
     }
+    // Drain any parser warnings the reader coalesced (e.g. a desynchronised pcapng
+    // stream trips the same one on millions of blocks) into the per-file tally, so
+    // they replay as a single count=N log line instead of flooding stdout
+    // (FR-DEBUG-4). Recorded only when --log is active, like the other deferred events.
+    if log_active {
+        for (reason, count) in reader.take_warnings() {
+            events.record_n(LogEvent::ParseWarning(reason), count);
+        }
+    }
 }
 
 /// Classify one packet's frame: strip the link header + FCS, parse the MAC header,

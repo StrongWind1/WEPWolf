@@ -194,7 +194,8 @@ fn section(out: &mut String, name: &str) {
 
 /// The closing accounting banner (`STATS.md`): per-packet and per-BSSID
 /// reconciliation grouped into ingest / networks / run sections, crack
-/// attribution per attack, the sweep/grind timing split, and peak RSS, closed by
+/// attribution per attack, the per-phase timing (discovery / ingest / recovery /
+/// brute force), and peak RSS, closed by
 /// a `wepwolf <version> (<git>)` footer. Every read packet stays accounted for --
 /// the five packet classes always sum to the total -- while the drop causes, the
 /// per-attack rows, and the `(BUG)` row expand only when nonzero, so a clean run
@@ -246,8 +247,13 @@ fn banner(out: &mut String, s: &Stats) {
     row(out, "  unknown", &s.unknown_bssids.to_string());
 
     section(out, "run");
+    // Wallclock broken into its phases (children indent under it, STATS.md): a real
+    // megacorpus spends most of its time in discovery + ingest, not cracking.
     row(out, "wallclock", &dur_human(s.wallclock));
-    row(out, "  sweep / grind", &format!("{} / {}", dur_human(s.sweep), dur_human(s.grind)));
+    row(out, "  discovery", &dur_human(s.discovery));
+    row(out, "  ingest", &dur_human(s.ingest));
+    row(out, "  recovery", &dur_human(s.recovery));
+    row(out, "  brute force", &dur_human(s.bruteforce));
     row(out, "peak RSS", &format!("{peak_mib} MiB"));
     let _ = writeln!(out, "================================================================");
     let _ = writeln!(out, "wepwolf {} ({})", env!("CARGO_PKG_VERSION"), env!("GIT_HASH"));
@@ -331,8 +337,10 @@ fn stats_plain(out: &mut String, s: &Stats) {
     st("uncracked_thin", &s.uncracked_thin.to_string());
     st("uncracked_infeasible", &s.uncracked_infeasible.to_string());
     st("wallclock_s", &secs_num(s.wallclock));
-    st("sweep_s", &secs_num(s.sweep));
-    st("grind_s", &secs_num(s.grind));
+    st("discovery_s", &secs_num(s.discovery));
+    st("ingest_s", &secs_num(s.ingest));
+    st("recovery_s", &secs_num(s.recovery));
+    st("bruteforce_s", &secs_num(s.bruteforce));
     st("peak_rss_bytes", &s.peak_rss_bytes.to_string());
 }
 
@@ -380,7 +388,7 @@ fn stats_json(out: &mut String, s: &Stats) {
     let dropped = s.packets_unknown_link + s.link_errors + s.malformed_mac + s.truncated;
     let _ = writeln!(
         out,
-        "{{\"type\":\"stats\",\"captures\":{},\"packets\":{{\"total\":{},\"data\":{},\"mgmt\":{},\"control\":{},\"extension\":{},\"dropped\":{}}},\"bssids\":{{\"total\":{},\"wep\":{},\"wpa\":{},\"open\":{},\"unknown\":{}}},\"wep\":{{\"data_frames\":{},\"auth_frames\":{},\"cracked\":{},\"uncracked_thin\":{},\"uncracked_infeasible\":{}}},\"keys_by\":{{\"ptw\":{},\"korek\":{},\"fms\":{},\"bias\":{},\"dict\":{},\"keygen\":{},\"ska\":{},\"brute\":{},\"reuse\":{},\"potfile\":{}}},\"timing\":{{\"wallclock_s\":{},\"sweep_s\":{},\"grind_s\":{}}},\"peak_rss_bytes\":{}}}",
+        "{{\"type\":\"stats\",\"captures\":{},\"packets\":{{\"total\":{},\"data\":{},\"mgmt\":{},\"control\":{},\"extension\":{},\"dropped\":{}}},\"bssids\":{{\"total\":{},\"wep\":{},\"wpa\":{},\"open\":{},\"unknown\":{}}},\"wep\":{{\"data_frames\":{},\"auth_frames\":{},\"cracked\":{},\"uncracked_thin\":{},\"uncracked_infeasible\":{}}},\"keys_by\":{{\"ptw\":{},\"korek\":{},\"fms\":{},\"bias\":{},\"dict\":{},\"keygen\":{},\"ska\":{},\"brute\":{},\"reuse\":{},\"potfile\":{}}},\"timing\":{{\"wallclock_s\":{},\"discovery_s\":{},\"ingest_s\":{},\"recovery_s\":{},\"bruteforce_s\":{}}},\"peak_rss_bytes\":{}}}",
         s.captures_read,
         s.packets_total,
         s.data_frames,
@@ -409,8 +417,10 @@ fn stats_json(out: &mut String, s: &Stats) {
         s.keys_by_reuse,
         s.keys_by_potfile,
         secs_num(s.wallclock),
-        secs_num(s.sweep),
-        secs_num(s.grind),
+        secs_num(s.discovery),
+        secs_num(s.ingest),
+        secs_num(s.recovery),
+        secs_num(s.bruteforce),
         s.peak_rss_bytes,
     );
 }

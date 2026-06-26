@@ -32,6 +32,10 @@ pub enum LogEvent {
     Malformed(String),
     /// A packet's interface carried no recognised link type.
     UnknownLink(u32),
+    /// A parser emitted a diagnostic warning while reading a file (e.g. a
+    /// desynchronised pcapng stream). Carried as a pre-normalised reason string so
+    /// identical warnings coalesce, the way the parse/link errors do.
+    ParseWarning(String),
 }
 
 /// A per-file tally of diagnostic events that coalesces identical ones.
@@ -54,10 +58,22 @@ impl EventTally {
     /// produces only a handful of distinct `(category, reason)` pairs, however many
     /// frames trip them.
     pub fn record(&mut self, event: LogEvent) {
+        self.record_n(event, 1);
+    }
+
+    /// Record `count` occurrences of one event at once, coalescing into an
+    /// identical earlier entry or appending a new one. Lets a reader that has
+    /// already counted a repeated warning internally (a desynchronised pcapng
+    /// stream trips the same one on millions of blocks) fold it in as a single
+    /// `count=N` entry instead of replaying it block by block.
+    pub fn record_n(&mut self, event: LogEvent, count: u64) {
+        if count == 0 {
+            return;
+        }
         if let Some(entry) = self.events.iter_mut().find(|(seen, _)| *seen == event) {
-            entry.1 += 1;
+            entry.1 += count;
         } else {
-            self.events.push((event, 1));
+            self.events.push((event, count));
         }
     }
 
@@ -123,6 +139,7 @@ impl Logger {
                 LogEvent::LinkError { dlt, reason } => self.link_error(dlt, &reason, count),
                 LogEvent::Malformed(reason) => self.malformed_frame(&reason, count),
                 LogEvent::UnknownLink(interface_id) => self.unknown_linktype(interface_id, count),
+                LogEvent::ParseWarning(reason) => self.parse_warning(&reason, count),
             }
         }
     }
@@ -162,6 +179,14 @@ impl Logger {
     pub fn unknown_linktype(&mut self, interface_id: u32, count: u64) {
         if self.sink.is_some() {
             self.line("unknown_linktype", &format!("interface={interface_id}"), count);
+        }
+    }
+
+    /// A parser tripped the same diagnostic warning on one or more blocks (e.g. a
+    /// desynchronised pcapng stream); `count` folds the repeats into one line.
+    pub fn parse_warning(&mut self, reason: &str, count: u64) {
+        if self.sink.is_some() {
+            self.line("parse_warning", &format!("reason={reason:?}"), count);
         }
     }
 

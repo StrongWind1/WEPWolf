@@ -95,8 +95,8 @@ pub struct Cli {
     ///
     /// A last-resort exhaustive sweep of the full 40-bit keyspace, run only on
     /// networks every statistical and wordlist attack left uncracked. Off by
-    /// default; bounded by --time-budget (1 minute per BSSID unless raised, or 0
-    /// for unlimited).
+    /// default; bounded by --per-bssid-time-max and by --total-brute-time-max over the
+    /// whole phase (300 s per network, unlimited total, unless raised).
     #[arg(long, help_heading = "Targeting & attacks", display_order = 4)]
     pub brute: bool,
 
@@ -108,16 +108,17 @@ pub struct Cli {
     #[arg(short = 'f', long, value_name = "FACTOR", help_heading = "Search tuning", display_order = 10)]
     pub fudge: Option<f32>,
 
-    /// Exhaustively sweep the last N key octets (aircrack -x; default 1, max 4).
+    /// Exhaustively sweep the last N key octets (aircrack -x; default 2, max 4).
     ///
-    /// After the statistical vote fixes the strong leading octets, brute-force
-    /// the N weakest trailing octets. Each extra octet multiplies the search by
-    /// 256, so raise it only when a key is nearly recovered.
+    /// After the statistical vote fixes the strong leading octets, brute-force the
+    /// N weakest trailing octets -- the unpredictable IPv4 ID/checksum octets real
+    /// traffic leaves. Each extra octet multiplies the search by 256, so raise it
+    /// only for a stubborn, nearly-recovered key.
     #[arg(
         short = 'x',
         long = "bruteforce",
         value_name = "N",
-        default_value_t = 1,
+        default_value_t = 2,
         help_heading = "Search tuning",
         display_order = 11
     )]
@@ -139,12 +140,30 @@ pub struct Cli {
     #[arg(short = 'j', long, value_name = "N", help_heading = "Performance", display_order = 20)]
     pub threads: Option<usize>,
 
-    /// Per-BSSID time budget in seconds for the sweep and brute (default 60).
+    /// Max seconds any one network may spend in recovery and brute force (default 300).
     ///
-    /// Caps the wall-clock each network may spend in the statistical sweep and
-    /// the brute force alike. Unset: 1 minute per BSSID. 0 means unlimited.
-    #[arg(long, value_name = "SECS", help_heading = "Performance", display_order = 21)]
-    pub time_budget: Option<u64>,
+    /// The per-network ceiling. Recovery scales a capture's share of it by unique-IV
+    /// count -- a rich capture earns the full cap, a thinner one a smaller share -- and
+    /// the brute force is bounded by it too. 0: unlimited.
+    #[arg(long, value_name = "SECS", default_value_t = 300, help_heading = "Performance", display_order = 21)]
+    pub per_bssid_time_max: u64,
+
+    /// Max total seconds for the whole 40-bit brute-force phase (default 0: unlimited).
+    ///
+    /// Caps the entire serialised brute force across all networks, not just each one
+    /// (that is --per-bssid-time-max): on a big corpus with --brute, many feasible
+    /// WEP-40 networks each searched in turn can run for hours. 0: unlimited.
+    #[arg(long, value_name = "SECS", default_value_t = 0, help_heading = "Performance", display_order = 22)]
+    pub total_brute_time_max: u64,
+
+    /// Max total seconds for the whole recovery phase (default 0: unlimited).
+    ///
+    /// Caps the parallel statistical/dictionary sweep across all networks, not just
+    /// each one (that is --per-bssid-time-max): on a huge corpus, even with each
+    /// network capped, the sweep over millions can be long. Once spent, networks not
+    /// yet started are skipped. 0: unlimited.
+    #[arg(long, value_name = "SECS", default_value_t = 0, help_heading = "Performance", display_order = 23)]
+    pub total_recovery_time_max: u64,
 
     /// Tab-separated records, tagged key / wep / stat (machine-readable).
     ///
@@ -232,7 +251,9 @@ fn run_inner(cli: &Cli) -> Result<ExitCode> {
     }
 
     debug.say(&format!("discovering capture files under {} path(s)...", cli.paths.len()));
+    let discovery_start = std::time::Instant::now();
     let inputs = input::expand_inputs(&cli.paths)?;
+    let discovery = discovery_start.elapsed();
     if inputs.is_empty() {
         return Err(Error::Io(std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -248,7 +269,9 @@ fn run_inner(cli: &Cli) -> Result<ExitCode> {
     // carver streams crack frames during the scan and flushes WEP-network beacons
     // afterwards, before any --bssid narrowing, so it captures every WEP network.
     let mut carver = cli.carve.as_deref().map(carve::Carver::create).transpose().map_err(Error::Io)?;
+    let ingest_start = std::time::Instant::now();
     let mut result = scan::scan(&inputs, &debug, &mut logger, &mut mem, &progress, carver.as_mut())?;
+    let ingest = ingest_start.elapsed();
     if let Some(c) = carver {
         let n = c.finish(&result.bssids).map_err(Error::Io)?;
         if !cli.quiet {
@@ -275,19 +298,34 @@ fn run_inner(cli: &Cli) -> Result<ExitCode> {
         None => KeyLen::all().to_vec(),
     };
     let attacks = build_attacks(cli)?;
-    // Resolve --time-budget: unset -> the 1-minute default, 0 -> unlimited, N -> N
-    // seconds. The same per-BSSID cap bounds both the sweep and the brute grind.
-    let budget = resolve_budget(cli.time_budget);
+    // Resolve the per-network cap (--per-bssid-time-max, default 300s) and the two
+    // opt-in total-phase caps (--total-recovery-time-max / --total-brute-time-max);
+    // 0 seconds means unlimited for each (FR-PERF-3). The engine scales the per-network
+    // cap down for a thin capture by unique-IV count, so a high-IV WEP-104 capture
+    // keeps the minutes its ladders need without a flag.
+    let budget = resolve_secs(cli.per_bssid_time_max);
+    let recovery_budget = resolve_secs(cli.total_recovery_time_max);
+    let brute_budget = resolve_secs(cli.total_brute_time_max);
     // A potfile seeds reuse with previously-recovered keys (hashcat-style).
     let seed_keys: Vec<_> = match &cli.potfile {
         Some(path) => potfile::load(path)?.into_iter().map(|(_, key)| key).collect(),
         None => Vec::new(),
     };
-    let outcome = attack::crack_all(&result.bssids, &attacks, &lengths, budget, &seed_keys, &progress);
+    let outcome = attack::crack_all(
+        &result.bssids,
+        &attacks,
+        &lengths,
+        budget,
+        recovery_budget,
+        brute_budget,
+        &seed_keys,
+        &progress,
+        &debug,
+    );
     let cracks = outcome.cracks;
-    // The sweep / grind phase split for the banner's timing rows (STATS.md).
-    result.stats.sweep = outcome.sweep;
-    result.stats.grind = outcome.grind;
+    // The recovery / brute-force phase split for the banner's timing (STATS.md).
+    result.stats.recovery = outcome.recovery;
+    result.stats.bruteforce = outcome.bruteforce;
     record_cracks(&mut result.stats, &result.bssids, &cracks);
     // Persist freshly recovered keys (not the ones the potfile already held).
     if let Some(path) = &cli.potfile {
@@ -303,6 +341,10 @@ fn run_inner(cli: &Cli) -> Result<ExitCode> {
     mem.sample();
     logger.flush()?;
     result.stats.peak_rss_bytes = mem.peak_rss_bytes();
+    // Per-phase timings for the banner's run section (STATS.md): on a megacorpus
+    // most of the wallclock is discovery + ingest, not recovery or brute force.
+    result.stats.discovery = discovery;
+    result.stats.ingest = ingest;
     result.stats.wallclock = run_start.elapsed();
 
     let format = if cli.json {
@@ -333,32 +375,31 @@ fn build_attacks(cli: &Cli) -> Result<Vec<Box<dyn Attack>>> {
         Box::new(FmsAttack),
         Box::new(BiasAttack { tuning }),
     ];
+    // Always try the built-in common/weak WEP keys (no --wordlist needed): the
+    // recurring defaults and weak patterns seen in real captures (the hex 1234567890
+    // and ASCII "12345" dominate). The dict's word check runs in the quick pass, so a
+    // default-key network -- including a thin one statistics cannot touch -- cracks
+    // before any expensive ladder. A --wordlist is merged in, and feeds the keygen.
+    let mut dict_words: Vec<Vec<u8>> = dict::COMMON_KEYS.iter().map(|k| k.as_bytes().to_vec()).collect();
     if let Some(path) = &cli.wordlist {
         let words = dict::load_wordlist(path)?;
-        attacks.push(Box::new(DictAttack::from_words(words.clone())));
+        dict_words.extend(words.iter().cloned());
         attacks.push(Box::new(KeygenAttack::from_words(words)));
     }
+    attacks.push(Box::new(DictAttack::from_words(dict_words)));
     if cli.brute {
         attacks.push(Box::new(BruteAttack));
     }
     Ok(attacks)
 }
 
-/// Default per-BSSID time budget when `--time-budget` is unset: 1 minute, applied
-/// to both the statistical sweep and the brute grind. A clean crack lands in well
-/// under a second; this only bounds the hopeless-but-not-thin networks whose
-/// backtracking would otherwise spin.
-const DEFAULT_TIME_BUDGET: std::time::Duration = std::time::Duration::from_mins(1);
-
-/// Resolve `--time-budget` into the per-BSSID deadline shared by the sweep and the
-/// grind (FR-PERF-3): unset -> the 60s default, `0` -> unlimited (`None`), `N` ->
-/// N seconds.
-const fn resolve_budget(time_budget: Option<u64>) -> Option<std::time::Duration> {
-    match time_budget {
-        None => Some(DEFAULT_TIME_BUDGET),
-        Some(0) => None,
-        Some(n) => Some(std::time::Duration::from_secs(n)),
-    }
+/// Resolve a `*-time-max` flag (seconds) into a deadline (FR-PERF-3): `0` -> unlimited
+/// (`None`), `N` -> N seconds. Shared by the per-network cap (`--per-bssid-time-max`,
+/// default 300 s) and the two total-phase caps (`--total-recovery-time-max` /
+/// `--total-brute-time-max`, default 0 = unlimited); the policy lives in the clap
+/// defaults, so this is a uniform mapping.
+const fn resolve_secs(secs: u64) -> Option<std::time::Duration> {
+    if secs == 0 { None } else { Some(std::time::Duration::from_secs(secs)) }
 }
 
 /// Parse `aa:bb:cc:dd:ee:ff` into a MAC address.
@@ -517,12 +558,12 @@ mod tests {
     }
 
     #[test]
-    fn resolve_budget_defaults_to_one_minute_and_zero_is_unlimited() {
-        // FR-PERF-3: --time-budget unset -> the 1-minute default (sweep and brute
-        // alike); 0 -> unlimited (no per-BSSID cap); N -> N seconds.
+    fn resolve_secs_maps_zero_to_unlimited() {
+        // FR-PERF-3: a `*-time-max` of 0 means unlimited, N means N seconds. The
+        // defaults (300 s per network, 0 for the two totals) live on the clap flags.
         use std::time::Duration;
-        assert_eq!(resolve_budget(None), Some(Duration::from_mins(1)), "unset is the 1-minute default");
-        assert_eq!(resolve_budget(Some(0)), None, "0 is unlimited");
-        assert_eq!(resolve_budget(Some(45)), Some(Duration::from_secs(45)), "N is N seconds");
+        assert_eq!(resolve_secs(0), None, "0 is unlimited");
+        assert_eq!(resolve_secs(300), Some(Duration::from_mins(5)), "the per-network default, 300 s");
+        assert_eq!(resolve_secs(45), Some(Duration::from_secs(45)), "N is N seconds");
     }
 }

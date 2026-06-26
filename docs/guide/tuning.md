@@ -54,22 +54,22 @@ The BSSID sweep and the multi-file ingest run on a work-stealing pool sized to a
 wepwolf -j 4 /captures/
 ```
 
-## Time budget: `--time-budget`
+## Time budget: `--per-bssid-time-max`
 
-Each network gets a wall-clock budget for its statistical sweep (default **30 seconds**) so one hard network cannot starve a large run. Raise it to give the deeper search more room, or lower it to move faster through many files:
+Each network gets a wall-clock budget for its recovery sweep and brute force (default **300 seconds**), scaled down by unique-IV count for a thin capture, so one hard network cannot starve a large run. Raise it to give the deeper search more room, or lower it to move faster through many files:
 
 ```sh
-wepwolf --time-budget 120 capture.cap    # up to two minutes per network
+wepwolf --per-bssid-time-max 120 capture.cap    # up to two minutes per network
 ```
 
-The same budget also bounds the optional 40-bit brute grind per network.
+The same budget bounds the optional 40-bit brute force per network. Two opt-in flags cap the *whole* phases across all networks: `--total-recovery-time-max` and `--total-brute-time-max` (default `0` = unlimited), so attempting every network on a huge corpus stays bounded -- once a total is spent, networks not yet started are skipped.
 
 ## The 40-bit brute: `--brute`
 
-For a WEP-40 key with no statistical signal (for example a random key in a capture too thin for PTW), `--brute` enables an exhaustive 2⁴⁰ search. It is off by default because it is slow. It applies only to WEP-40 (2¹⁰⁴ is infeasible) and runs one network at a time on the full machine, bounded by `--time-budget`, with a SIMD-batched prefilter that rejects almost every candidate cheaply. The live bar shows percent, keys-per-second, ETA, and the active SIMD tier.
+For a WEP-40 key with no statistical signal (for example a random key in a capture too thin for PTW), `--brute` enables an exhaustive 2⁴⁰ search. It is off by default because it is slow. It applies only to WEP-40 (2¹⁰⁴ is infeasible) and runs one network at a time on the full machine, bounded by `--per-bssid-time-max` (and by `--total-brute-time-max` over the whole phase), with a SIMD-batched prefilter that rejects almost every candidate cheaply. The live bar shows percent, keys-per-second, ETA, and the active SIMD tier.
 
 ```sh
-wepwolf --brute --time-budget 600 capture.cap
+wepwolf --brute --per-bssid-time-max 600 capture.cap
 ```
 
 ## Performance notes

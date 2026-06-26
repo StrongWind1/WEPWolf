@@ -28,7 +28,7 @@ WEPWolf takes one or more capture files or directories, scans them, and recovers
 | Option | Description |
 |---|---|
 | `-f`, `--fudge FACTOR` | KoreK/bias fudge: keep candidate octets whose vote is at least `top / FACTOR`. Higher = wider, slower search. Default: 5 for WEP-40, 2 for longer keys (aircrack-ng `-f`). |
-| `-x`, `--bruteforce N` | Exhaustively sweep the last `N` key octets (1-4). Default: 1 (aircrack-ng `-x`). |
+| `-x`, `--bruteforce N` | Exhaustively sweep the last `N` key octets (1-4). Default: 2 (aircrack-ng `-x`). |
 | `-c`, `--alnum` | Restrict candidate octets to printable ASCII, for expected passphrase keys (aircrack-ng `-c`). |
 
 ### Performance
@@ -36,7 +36,9 @@ WEPWolf takes one or more capture files or directories, scans them, and recovers
 | Option | Description |
 |---|---|
 | `-j`, `--threads N` | Worker threads for the parallel BSSID sweep and ingest. Default: all cores. |
-| `--time-budget SECS` | Per-BSSID time budget in seconds for the statistical sweep and the brute. Unset: a 30-second sweep per BSSID, unbounded brute. |
+| `--per-bssid-time-max SECS` | Max seconds any one network may spend in recovery and brute force, scaled down by unique-IV count for a thin capture. Default: 300; `0` = unlimited. |
+| `--total-brute-time-max SECS` | Max total seconds for the whole 40-bit brute-force phase across all networks. Default: 0 (unlimited). |
+| `--total-recovery-time-max SECS` | Max total seconds for the whole recovery phase across all networks; once spent, networks not yet started are skipped. Default: 0 (unlimited). |
 
 ### Output
 
@@ -86,10 +88,10 @@ wepwolf --bssid 00:11:22:33:44:55 capture.cap
 wepwolf -w rockyou.txt capture.cap
 
 # Only WEP-104, restrict to ASCII keys, give each network two minutes
-wepwolf --keylen 104 -c --time-budget 120 capture.cap
+wepwolf --keylen 104 -c --per-bssid-time-max 120 capture.cap
 
 # Enable the last-resort 40-bit brute force with a 10-minute per-network cap
-wepwolf --brute --time-budget 600 capture.cap
+wepwolf --brute --per-bssid-time-max 600 capture.cap
 
 # Machine-readable output for a pipeline
 wepwolf --json /captures/ > keys.ndjson

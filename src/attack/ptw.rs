@@ -27,7 +27,11 @@ impl Attack for PtwAttack {
     }
 
     fn applicable(&self, bssid: &BssidWep, len: KeyLen) -> bool {
-        super::unique_iv_count(bssid) >= super::min_samples(len)
+        super::worth_attempting(bssid, len)
+    }
+
+    fn needs_convergence(&self) -> bool {
+        true
     }
 
     fn run(&self, bssid: &BssidWep, len: KeyLen, verifier: &Verifier) -> Option<WepKey> {
