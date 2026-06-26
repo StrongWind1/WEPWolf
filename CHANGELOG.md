@@ -2,7 +2,7 @@
 
 All notable changes to WEPWolf are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.1.0] - 2026-06-26
 
 ### Added
 
@@ -83,6 +83,7 @@ All notable changes to WEPWolf are documented here. The format follows [Keep a C
 - WEPWolf is passive and offline: it reads capture files only, and never captures traffic, injects frames, or touches a radio.
 - On the aircrack-ng `wep_64_ptw.cap` reference capture it recovers the key in roughly a fifth of a second.
 
-[Unreleased]: https://github.com/StrongWind1/WEPWolf/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/StrongWind1/WEPWolf/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/StrongWind1/WEPWolf/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/StrongWind1/WEPWolf/compare/v0.1.0...v1.0.0
 [0.1.0]: https://github.com/StrongWind1/WEPWolf/releases/tag/v0.1.0
