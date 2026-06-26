@@ -67,7 +67,7 @@ pub use engine::{CrackOutcome, CrackResult, crack, crack_all};
 /// WEP-104/232 are not attempted below it (too few IVs to ever converge), and it is
 /// the threshold below which an *uncracked* WEP-40 network is reported "capture too
 /// thin" (FR-OUT-5). It is no longer a WEP-40 attack gate -- every network with real
-/// IV material is attempted (see [`worth_attempting`]), so a weak or default key is
+/// IV material is attempted (see `worth_attempting`), so a weak or default key is
 /// never pre-skipped; for WEP-40 the floor only labels the result. Not an acceptance
 /// threshold: the `Verifier` (C4) remains the only thing that declares a key.
 #[must_use]
