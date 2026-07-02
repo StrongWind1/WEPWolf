@@ -50,4 +50,4 @@ It is a single Rust binary built with `make release` (see [Installation](getting
 
 ## Where do I report bugs or contribute?
 
-On [GitHub](https://github.com/StrongWind1/WEPWolf). See `CONTRIBUTING.md` for the development workflow.
+On [GitHub](https://github.com/StrongWind1/WEPWolf/issues). The development workflow is in the project README.

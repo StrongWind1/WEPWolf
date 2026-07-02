@@ -158,7 +158,7 @@ It is deliberately **passive and offline only** -- the active tools (packet inje
 
 ## Contributing
 
-See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the development workflow and commit conventions.
+Conventional commit messages (`feat:`, `fix:`, `docs:`); run `make check` before every commit. Every change maps to an `FR-*` requirement and lands a test.
 
 ---
 
