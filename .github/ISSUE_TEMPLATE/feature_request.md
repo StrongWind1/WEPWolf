@@ -1,27 +1,16 @@
 ---
 name: Feature request
-about: Propose new functionality
-title: "[feat] "
+about: Suggest a new feature or improvement
+title: ""
 labels: enhancement
+assignees: ""
 ---
 
-## Problem
+**What problem does this solve?**
+A clear description of the problem or use case.
 
-<!-- What is missing? One paragraph. -->
+**Proposed solution**
+How you'd like WEPWolf to handle it (CLI flags, output format, etc.).
 
-## Proposed solution
-
-<!-- How should wepwolf behave? Note where it fits: capture parsing, IV /
-keystream collection, the key-recovery attack, or output. -->
-
-## Scope check
-
-- [ ] This stays within "offline capture analysis" (no live capture, no frame injection).
-- [ ] This is in scope: WEP (40-bit / 104-bit) key recovery from pcap/pcapng captures.
-      Out of scope: WPA/WPA2/WPA3, live capture, and frame injection.
-- [ ] No new crate dependency *or* the dependency is justified per CONTRIBUTING.md
-      (the runtime dependency budget is deliberately small).
-
-## Alternatives considered
-
-<!-- What else did you look at? Why is this the right shape? -->
+**Alternatives considered**
+Any workarounds you've tried or other tools that handle this.

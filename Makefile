@@ -343,7 +343,10 @@ hooks:
 clean:
 	$(CARGO) clean
 	rm -rf $(DIST)
-	rm -rf site .venv uv.lock
+	rm -rf site .cache .venv uv.lock
+	rm -f *.rlib
+	find . -path ./.venv -prune -o -type d -name '__pycache__' -exec rm -rf {} +
+	find . -path ./.venv -prune -o -type f -name '*.py[co]' -exec rm -f {} +
 	# Note: ~/.cargo/advisory-db is intentionally preserved so `make audit`
 	# remains usable after a clean. Remove it manually if you need a fresh
 	# advisory fetch.
@@ -355,3 +358,19 @@ check: fmt lint typecheck test audit audit-stats
 
 # Full verification gate -- run before every push (adds supply-chain, docs, hygiene).
 check-all: fmt lint deny typecheck test-matrix audit audit-stats doc hygiene machete
+
+
+# --- Release: bump version, refresh deps, verify, signed commit + signed tag, push ---
+.PHONY: cut-release
+cut-release:
+	@test -n "$(VERSION)" || { echo "usage: make cut-release VERSION=X.Y.Z"; exit 1; }
+	@command -v cargo-set-version > /dev/null 2>&1 || cargo install cargo-edit --locked
+	cargo set-version -p wepwolf "$(VERSION)"
+	cargo upgrade --incompatible
+	cargo update
+	$(MAKE) check-all
+	git add Cargo.toml Cargo.lock
+	@git diff --cached --quiet || git commit -S -m "chore(release): v$(VERSION)"
+	git tag -s "v$(VERSION)" -m "v$(VERSION)"
+	git push origin HEAD
+	git push origin "v$(VERSION)"

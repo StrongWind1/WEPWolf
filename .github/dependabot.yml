@@ -1,26 +1,51 @@
 version: 2
-updates:
-  # Rust crates: one weekly pull request carrying every available update -- major,
-  # minor, and patch, for every dependency -- so the lockfile stays current with
-  # the fewest PRs. The project's policy is always-latest: fix the code if a bump
-  # breaks, not the reverse.
-  - package-ecosystem: cargo
-    directory: /
-    schedule:
-      interval: weekly
-    open-pull-requests-limit: 10
-    groups:
-      all-dependencies:
-        patterns: ["*"]
-        update-types: [major, minor, patch]
 
-  # GitHub Actions: likewise collapsed into a single weekly PR.
+# Grouped, security-forward dependency updates.
+#   version updates  -> ONE grouped PR per ecosystem, weekly, after a cooldown
+#                       so brand-new (possibly broken) releases settle first.
+#   security updates -> ONE grouped PR per ecosystem, applied promptly --
+#                       cooldown never delays security fixes.
+# NOTE: security updates also require "Dependabot alerts" + "Dependabot
+# security updates" to be enabled in the repository's Settings -> Security.
+updates:
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
-    open-pull-requests-limit: 10
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: chore
+      include: scope
+    cooldown:
+      default-days: 7
+      semver-major-days: 14
     groups:
-      all-actions:
-        patterns: ["*"]
-        update-types: [major, minor, patch]
+      github-actions:
+        applies-to: version-updates
+        patterns:
+          - "*"
+      github-actions-security:
+        applies-to: security-updates
+        patterns:
+          - "*"
+
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: chore
+      include: scope
+    cooldown:
+      default-days: 7
+      semver-major-days: 14
+    groups:
+      dependencies:
+        applies-to: version-updates
+        patterns:
+          - "*"
+      security:
+        applies-to: security-updates
+        patterns:
+          - "*"
