@@ -1,6 +1,6 @@
 [package]
 name = "wepwolf"
-version = "1.2.0"
+version = "1.2.1"
 edition = "2024"
 rust-version = "1.95"
 description = "Offline, passive WEP key recovery from 802.11 captures"
@@ -11,13 +11,8 @@ documentation = "https://strongwind1.github.io/WEPWolf/"
 readme = "README.md"
 keywords = ["wifi", "security", "wireless", "wep", "pcap"]
 categories = ["command-line-utilities", "network-programming"]
-# Files shipped in the published crate: source, tests, and benches. The local
-# test data (ref/), the spec scratch (specs/), and the MkDocs site (docs/,
-# site/) are repository-only and are not part of the package.
 include = [
     "/src/**/*",
-    "/tests/**/*",
-    "/benches/**/*",
     "/build.rs",
     "/Cargo.toml",
     "/Cargo.lock",
