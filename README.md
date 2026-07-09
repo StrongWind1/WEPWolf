@@ -71,6 +71,12 @@ That crack runs in a fraction of a second. The same keys, summary, and stats are
 
 ## Installation
 
+### From crates.io
+
+```sh
+cargo install wepwolf
+```
+
 ### Prebuilt binaries
 
 Download the binary for your platform from the [latest release](https://github.com/StrongWind1/WEPWolf/releases/latest) and put it on your `PATH`.
