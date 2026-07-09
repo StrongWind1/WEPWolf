@@ -9,7 +9,7 @@ repository = "https://github.com/StrongWind1/WEPWolf"
 homepage = "https://github.com/StrongWind1/WEPWolf"
 documentation = "https://strongwind1.github.io/WEPWolf/"
 readme = "README.md"
-keywords = ["wifi", "security", "802.11", "wep", "pcap"]
+keywords = ["wifi", "security", "wireless", "wep", "pcap"]
 categories = ["command-line-utilities", "network-programming"]
 # Files shipped in the published crate: source, tests, and benches. The local
 # test data (ref/), the spec scratch (specs/), and the MkDocs site (docs/,
