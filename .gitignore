@@ -240,3 +240,4 @@ System Volume Information/
 
 # Local bench output
 /target/bench/
+*.egg-info/
