@@ -1,5 +1,5 @@
 site_name: WEPWolf
-site_description: Offline, passive WEP key recovery from 802.11 captures — a faster, parity-or-better alternative to aircrack-ng.
+site_description: Offline, passive WEP key recovery from 802.11 captures -- a faster, parity-or-better alternative to aircrack-ng.
 site_url: https://strongwind.dev/WEPWolf/
 repo_url: https://github.com/StrongWind1/WEPWolf
 repo_name: StrongWind1/WEPWolf
@@ -14,7 +14,7 @@ theme:
   icon:
     repo: fontawesome/brands/github
   palette:
-    # Dark mode (default) — respects system preference
+    # Dark mode (default) -- respects system preference
     - media: "(prefers-color-scheme: dark)"
       scheme: slate
       primary: custom
@@ -22,7 +22,7 @@ theme:
       toggle:
         icon: material/weather-night
         name: Switch to light mode
-    # Light mode — respects system preference
+    # Light mode -- respects system preference
     - media: "(prefers-color-scheme: light)"
       scheme: default
       primary: custom
