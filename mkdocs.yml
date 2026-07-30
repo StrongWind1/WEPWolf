@@ -1,8 +1,10 @@
 site_name: WEPWolf
-site_description: Offline, passive WEP key recovery from 802.11 captures -- a faster, parity-or-better alternative to aircrack-ng.
-site_url: https://strongwind1.github.io/WEPWolf/
+site_description: Offline, passive WEP key recovery from 802.11 captures — a faster, parity-or-better alternative to aircrack-ng.
+site_url: https://strongwind.dev/WEPWolf/
 repo_url: https://github.com/StrongWind1/WEPWolf
 repo_name: StrongWind1/WEPWolf
+edit_uri: edit/main/docs/
+copyright: Copyright &copy; 2025 - 2026 StrongWind1
 
 theme:
   name: material
@@ -12,23 +14,24 @@ theme:
   icon:
     repo: fontawesome/brands/github
   palette:
-    # Dark mode (default) -- respects system preference
+    # Dark mode (default) — respects system preference
     - media: "(prefers-color-scheme: dark)"
       scheme: slate
       primary: custom
-      accent: amber
+      accent: custom
       toggle:
         icon: material/weather-night
         name: Switch to light mode
-    # Light mode -- respects system preference
+    # Light mode — respects system preference
     - media: "(prefers-color-scheme: light)"
       scheme: default
       primary: custom
-      accent: amber
+      accent: custom
       toggle:
         icon: material/weather-sunny
         name: Switch to dark mode
   features:
+    # Navigation
     - navigation.instant
     - navigation.instant.prefetch
     - navigation.instant.progress
@@ -38,17 +41,26 @@ theme:
     - navigation.top
     - navigation.indexes
     - navigation.footer
+    # Table of contents
     - toc.follow
+    # Search
     - search.highlight
     - search.suggest
     - search.share
+    # Header
     - header.autohide
     - announce.dismiss
+    # Content
     - content.code.copy
     - content.code.annotate
+    - content.action.edit
+    - content.action.view
 
 plugins:
   - search
+  # Downloads the Google Fonts requested by theme.font at build time so the
+  # published site makes no third-party requests.
+  - privacy
 
 markdown_extensions:
   - admonition
@@ -96,6 +108,14 @@ extra:
   generator: false
 
 extra_css:
-  - stylesheets/extra.css
+  # theme.css is the site palette; primary and accent are both `custom`,
+  # so every Material colour variable is defined there.
+  - stylesheets/theme.css
 
 strict: true
+
+validation:
+  omitted_files: warn
+  absolute_links: warn
+  unrecognized_links: warn
+  anchors: warn

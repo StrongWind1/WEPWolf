@@ -357,7 +357,8 @@ clean:
 check: fmt lint typecheck test audit audit-stats
 
 # Full verification gate -- run before every push (adds supply-chain, docs, hygiene).
-check-all: fmt lint deny typecheck test-matrix audit audit-stats doc hygiene machete
+# `doc` is rustdoc; `docs` is the strict MkDocs build that ships to strongwind.dev.
+check-all: fmt lint deny typecheck test-matrix audit audit-stats doc docs hygiene machete
 
 
 # --- Release: bump version, refresh deps, verify, signed commit + signed tag, push ---
