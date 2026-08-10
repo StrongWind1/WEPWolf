@@ -18,7 +18,7 @@
   <a href="#installation">Installation</a> &bull;
   <a href="#cli-reference">CLI reference</a> &bull;
   <a href="#how-wepwolf-compares-to-aircrack-ng">vs aircrack-ng</a> &bull;
-  <a href="https://strongwind1.github.io/WEPWolf/">Docs</a>
+  <a href="https://strongwind.dev/WEPWolf/">Docs</a>
 </p>
 
 ---
@@ -138,7 +138,7 @@ Exit code is `0` iff at least one key was recovered, `1` if none, `2` on a fatal
 
 `--carve` collects the WEP frames wepwolf's parser recovers -- across every input file, with its tiered link-header recovery applied -- into one self-contained pcap. Because the frames are written post-strip as raw 802.11 with zeroed timestamps, the output normalises mixed radiotap/Prism/AVS inputs to a single link type that both wepwolf and aircrack-ng read, and many capture files collapse into one capture you can re-crack or hand to another tool.
 
-The full option reference, output formats, and tuning guide are in the [documentation](https://strongwind1.github.io/WEPWolf/).
+The full option reference, output formats, and tuning guide are in the [documentation](https://strongwind.dev/WEPWolf/).
 
 ---
 
@@ -158,7 +158,7 @@ aircrack-ng is the reference WEP cracker and WEPWolf's ground truth -- every key
 - reads the cleartext destination MAC to mine IPv6 Neighbor Discovery and EAPOL known-plaintext the IPv4-shaped guess would miss;
 - carves the exact WEP frame set it cracks from into one re-crackable pcap.
 
-It is deliberately **passive and offline only** -- the active tools (packet injection, replay, deauthentication) are the aircrack-ng suite's job. The full breakdown is in the [documentation](https://strongwind1.github.io/WEPWolf/comparison/).
+It is deliberately **passive and offline only** -- the active tools (packet injection, replay, deauthentication) are the aircrack-ng suite's job. The full breakdown is in the [documentation](https://strongwind.dev/WEPWolf/comparison/).
 
 ---
 
