@@ -12,13 +12,13 @@ readme = "README.md"
 keywords = ["wifi", "security", "wireless", "wep", "pcap"]
 categories = ["command-line-utilities", "network-programming"]
 include = [
-    "/src/**/*",
-    "/build.rs",
-    "/Cargo.toml",
-    "/Cargo.lock",
-    "/README.md",
-    "/LICENSE",
-    "/CHANGELOG.md",
+  "/src/**/*",
+  "/build.rs",
+  "/Cargo.toml",
+  "/Cargo.lock",
+  "/README.md",
+  "/LICENSE",
+  "/CHANGELOG.md",
 ]
 
 [package.metadata.cargo-machete]
@@ -28,7 +28,9 @@ ignored = ["md-5"]
 [dependencies]
 # Gzip decompression for .pcap.gz / .pcapng.gz inputs (pure-Rust backend; keeps
 # the cargo-deny supply-chain gate tight). Ported with the WPAWolf input layer.
-flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+flate2 = { version = "1", default-features = false, features = [
+  "rust_backend",
+] }
 # IEEE 802.11 FCS verification -- IEEE CRC-32 (ISO 3309), SIMD-accelerated.
 # Ported with the WPAWolf link layer. NOTE: this is the on-air frame FCS, not
 # the WEP ICV (which crate::crypto::crc32 computes over the RC4-decrypted body).
@@ -37,7 +39,14 @@ crc32fast = "1"
 # Ported from the WPAWolf progress helpers; pinned to match its version.
 sysinfo = "0.39"
 # CLI argument parsing for the oneshot driver. Minimal feature set.
-clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "color"] }
+clap = { version = "4", default-features = false, features = [
+  "std",
+  "derive",
+  "help",
+  "usage",
+  "error-context",
+  "color",
+] }
 # MD5 for the 104-bit weak-key generator (RustCrypto). The keygen derives WEP
 # keys from passphrases; this is the standard "128-bit ASCII" derivation.
 md-5 = "0.11"
