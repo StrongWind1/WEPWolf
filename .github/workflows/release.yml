@@ -323,12 +323,13 @@ jobs:
       - name: Generate SHA256SUMS
         # sha256 hashes for every artifact except SHA256SUMS itself. `sort`
         # keeps the file reproducible so two builds of the same commit
-        # produce byte-identical SHA256SUMS.
+        # produce byte-identical SHA256SUMS. This job runs on macOS, so only
+        # primaries BSD find has are used (no GNU -printf).
         run: |
           set -euo pipefail
           cd dist
-          find . -maxdepth 1 -type f ! -name SHA256SUMS ! -name '*.tmp' -printf '%f\n' \
-            | sort \
+          find . -maxdepth 1 -type f ! -name SHA256SUMS ! -name '*.tmp' -exec basename {} \; \
+            | LC_ALL=C sort \
             | while IFS= read -r f; do shasum -a 256 -b "$f"; done > SHA256SUMS.tmp
           mv SHA256SUMS.tmp SHA256SUMS
           cat SHA256SUMS
