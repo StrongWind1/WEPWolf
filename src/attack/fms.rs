@@ -34,6 +34,11 @@ impl Attack for FmsAttack {
         super::worth_attempting(bssid, len)
     }
 
+    /// FMS tries its one argmax key, so the full pass would only repeat the quick one.
+    fn single_pass(&self) -> bool {
+        true
+    }
+
     fn run(&self, bssid: &BssidWep, len: KeyLen, verifier: &Verifier) -> Option<WepKey> {
         let secret = recover(bssid.ivs(), len.byte_len());
         let key = WepKey::new(&secret)?;

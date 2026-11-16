@@ -194,6 +194,42 @@ pub struct EncFrame {
     pub key_id: u8,
 }
 
+/// A known-plaintext anchor for the brute's prefilter (`crate::attack::brute`).
+///
+/// The IV of one captured frame and the keystream the true key must produce over
+/// that frame's first four octets (`ciphertext XOR known plaintext`). It rejects
+/// candidate keys cheaply *before* `crate::wep::Verifier::accept`, which stays the
+/// sole acceptance path (C4) -- a survivor is still verified.
+///
+/// It is only sound when the plaintext really is known. The harvester therefore
+/// records one from a frame whose leading octets are fixed by the standard --
+/// the LLC/SNAP header of a data MSDU's first fragment, or the fixed fields of a
+/// Shared-Key authentication frame 3 -- and never from a later fragment, whose
+/// body is mid-packet. A wrong anchor would reject the true key and leave the
+/// whole 2^40 sweep empty-handed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KnownPrefix {
+    /// The IV of the source frame (the RC4 seed prefix `IV || secret`).
+    pub iv: [u8; 3],
+    /// The keystream the true key yields over the prefix.
+    pub keystream: [u8; 4],
+}
+
+impl KnownPrefix {
+    /// The anchor for a frame with IV `iv` whose encrypted body `cipher` is known
+    /// to decrypt to `plain` over its first four octets, or `None` if the body is
+    /// shorter than that.
+    #[must_use]
+    pub fn from_known_plaintext(iv: [u8; 3], cipher: &[u8], plain: [u8; 4]) -> Option<Self> {
+        let head: [u8; 4] = cipher.get(..4)?.try_into().ok()?;
+        let mut keystream = [0u8; 4];
+        for (slot, (c, p)) in keystream.iter_mut().zip(head.iter().zip(&plain)) {
+            *slot = c ^ p;
+        }
+        Some(Self { iv, keystream })
+    }
+}
+
 /// The encryption a BSSID uses, resolved from its observed frames.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Encryption {
@@ -224,6 +260,10 @@ pub struct WepMaterial {
     pub ska_keystream: Option<Vec<u8>>,
     /// A few full WEP frames retained for the `Verifier` (the accept path).
     pub enc_frames: Vec<EncFrame>,
+    /// The brute's known-plaintext anchor, from the first frame whose leading
+    /// plaintext is fixed by the standard (see [`KnownPrefix`]). `None` when no
+    /// such frame was seen -- the brute then verifies every candidate in full.
+    pub known_prefix: Option<KnownPrefix>,
 }
 
 /// Everything `WEPWolf` has gathered for one BSSID.
@@ -293,6 +333,13 @@ impl BssidWep {
         self.material.as_deref().and_then(|m| m.ska_keystream.as_deref())
     }
 
+    /// The brute's known-plaintext anchor, if a frame with standard-fixed leading
+    /// plaintext was harvested (see [`KnownPrefix`]).
+    #[must_use]
+    pub fn known_prefix(&self) -> Option<KnownPrefix> {
+        self.material.as_deref().and_then(|m| m.known_prefix)
+    }
+
     /// Mutable access to the attack material, allocating the box on first use.
     /// Called only on the WEP harvest path, so non-WEP records never allocate it.
     pub fn material_mut(&mut self) -> &mut WepMaterial {
@@ -339,8 +386,9 @@ impl BssidWep {
     /// several files; each file builds an independent record and they are merged
     /// here in input-file order, so the result is identical to a sequential scan
     /// regardless of thread scheduling. Material concatenates, counts add, and the
-    /// evidence flags OR together; the ESSID and SKA keystream are taken from the
-    /// first file that carried them, and retained full frames stop at the cap.
+    /// evidence flags OR together; the ESSID, SKA keystream, and brute anchor are
+    /// taken from the first file that carried them, and retained full frames stop
+    /// at the cap.
     pub fn merge_from(&mut self, other: Self) {
         if self.essid.is_none() {
             self.essid = other.essid;
@@ -353,6 +401,9 @@ impl BssidWep {
             m.arp_keystreams.extend(om.arp_keystreams);
             if m.ska_keystream.is_none() {
                 m.ska_keystream = om.ska_keystream;
+            }
+            if m.known_prefix.is_none() {
+                m.known_prefix = om.known_prefix;
             }
             for frame in om.enc_frames {
                 // Per-slot cap, mirroring `retain_enc_frame` (inlined to avoid re-borrowing self).

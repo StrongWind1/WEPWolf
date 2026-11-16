@@ -71,6 +71,11 @@ impl Attack for DictAttack {
         !self.words.is_empty()
     }
 
+    /// The candidate list is fixed, so the full pass would only repeat the quick one.
+    fn single_pass(&self) -> bool {
+        true
+    }
+
     fn run(&self, _bssid: &BssidWep, len: KeyLen, verifier: &Verifier) -> Option<WepKey> {
         let want = len.byte_len();
         for word in &self.words {

@@ -43,6 +43,25 @@ pub struct Packet {
     pub interface_id: u32,
     /// Raw frame data beginning at the link-layer header.
     pub data: Vec<u8>,
+    /// The packet's length on the wire in octets, as the capture record states it
+    /// (pcap `orig_len`, pcapng EPB Original Packet Length).
+    ///
+    /// Larger than `data.len()` when the capture cut the packet short at a snap
+    /// length. Writers that leave the field zero or smaller than the captured
+    /// length are read as "not truncated" (see [`Packet::missing`]).
+    pub orig_len: u32,
+}
+
+impl Packet {
+    /// Octets the capture cut off the end of this packet; 0 when it is complete.
+    ///
+    /// A packet cut short keeps its leading octets intact but has lost its tail --
+    /// for a WEP frame, the ICV -- so it can still give up an IV and the keystream
+    /// under its known header, but it can never confirm a key.
+    #[must_use]
+    pub fn missing(&self) -> u32 {
+        self.orig_len.saturating_sub(u32::try_from(self.data.len()).unwrap_or(u32::MAX))
+    }
 }
 
 /// Byte order for a capture file or pcapng section, detected from the magic/BOM field.

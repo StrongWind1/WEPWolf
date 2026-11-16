@@ -14,8 +14,9 @@ use md5 as _;
 use rayon as _;
 use sysinfo as _;
 
+use wepwolf::crypto::rc4::Rc4Lanes;
 use wepwolf::crypto::{Rc4, crc32};
-use wepwolf::simd::{self, SimdTier};
+use wepwolf::simd::{self, Crc32Fold, SimdTier};
 
 const TIERS: [SimdTier; 5] =
     [SimdTier::Scalar, SimdTier::Sse2Ssse3, SimdTier::Avx2, SimdTier::Avx512Skx, SimdTier::Avx512Icl];
@@ -72,4 +73,48 @@ fn primitive_known_answers() {
     let mut ks = [0u8; 3];
     Rc4::new(b"Wiki").keystream(&mut ks);
     assert_eq!(ks, [0x60, 0x44, 0xDB]);
+}
+
+#[test]
+fn lane_kernel_matches_scalar_for_every_wep_seed_length() {
+    // FR-SIMD-2: the lane-interleaved RC4 the verifier and the brute batch through is
+    // byte-exact with one scalar stream per lane, for the WEP-40 / 104 / 232 seeds
+    // (8 / 16 / 32 octets), with fewer lanes scheduled than the kernel holds, and
+    // across calls (the lanes share one running output index).
+    for (seed_len, lanes) in [(8usize, 8usize), (16, 7), (32, 3), (8, 1)] {
+        let mut seeds = [[0u8; 32]; 8];
+        for (lane, seed) in seeds.iter_mut().enumerate() {
+            for (pos, octet) in seed.iter_mut().enumerate() {
+                *octet = u8::try_from((lane * 41 + pos * 13 + seed_len) & 0xff).unwrap_or(0);
+            }
+        }
+        let mut kernel = Rc4Lanes::<8>::schedule(&seeds, seed_len, lanes);
+        let mut head = [[0u8; 256]; 8];
+        let mut tail = [[0u8; 256]; 8];
+        kernel.keystream(0..lanes, &mut head, 256);
+        kernel.keystream(0..lanes, &mut tail, 100);
+        for (lane, seed) in seeds.iter().enumerate().take(lanes) {
+            let mut want = [0u8; 356];
+            Rc4::new(&seed[..seed_len]).keystream(&mut want);
+            assert_eq!(head[lane][..], want[..256], "lane {lane}, seed length {seed_len}");
+            assert_eq!(tail[lane][..100], want[256..], "lane {lane}, seed length {seed_len} (second call)");
+        }
+    }
+}
+
+#[test]
+fn streaming_crc_fold_matches_scalar() {
+    // FR-SIMD-2: folding a buffer in blocks gives the scalar CRC-32 of the whole,
+    // wherever the blocks split -- the verifier folds each frame a block at a time.
+    let data: Vec<u8> = (0..2000u32).map(|i| u8::try_from(i.wrapping_mul(193) & 0xff).unwrap_or(0)).collect();
+    for len in [0usize, 1, 4, 255, 256, 257, 1500, 2000] {
+        let want = crc32(&data[..len]);
+        for block in [1usize, 7, 64, 128, 256, 300, 4096] {
+            let mut fold = Crc32Fold::default();
+            for chunk in data[..len].chunks(block) {
+                fold.update(chunk);
+            }
+            assert_eq!(fold.finish(), want, "len {len}, block {block}");
+        }
+    }
 }

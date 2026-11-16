@@ -18,6 +18,18 @@
 /// Reflected IEEE CRC-32 polynomial (`0xEDB8_8320`), i.e. `0x04C1_1DB7` bit-reversed.
 const POLY: u32 = 0xEDB8_8320;
 
+/// The value this CRC-32 takes over any message followed by that message's own
+/// CRC in little-endian order -- which is exactly how WEP lays out `Data || ICV`.
+///
+/// It is a constant, independent of the message, and no other four-octet trailer
+/// produces it: for a fixed message the final register is a bijection of the
+/// trailer. So `crc32(data || icv) == RESIDUE` holds exactly when `icv` is the
+/// CRC of `data` -- an equivalence, not an approximation -- which lets the ICV be
+/// checked by folding the whole decrypted body in one pass, without first
+/// splitting the ICV off its tail (`crate::wep::verify`). The same residue backs
+/// the 802.11 FCS check (`crate::link::fcs`).
+pub const RESIDUE: u32 = 0x2144_DF1C;
+
 /// Compute the IEEE CRC-32 of `data` (the WEP ICV polynomial).
 ///
 /// Bit-reflected, init `0xFFFF_FFFF`, final XOR `0xFFFF_FFFF`. Matches zlib
@@ -39,7 +51,37 @@ pub fn crc32(data: &[u8]) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::crc32;
+    use super::{RESIDUE, crc32};
+
+    // The residue check is exactly the split check: a body followed by its own
+    // little-endian CRC folds to RESIDUE, and any other trailer does not.
+    #[test]
+    fn residue_is_equivalent_to_the_split_icv_check() {
+        for len in [0usize, 1, 4, 5, 36, 255, 256, 257, 1500] {
+            // A deterministic body: a byte-wide recurrence seeded from the length.
+            let mut octet = len.to_le_bytes()[0];
+            let body: Vec<u8> = (0..len)
+                .map(|_| {
+                    octet = octet.wrapping_mul(31).wrapping_add(7);
+                    octet
+                })
+                .collect();
+            let icv = crc32(&body).to_le_bytes();
+            let mut whole = body.clone();
+            whole.extend_from_slice(&icv);
+            assert_eq!(crc32(&whole), RESIDUE, "len {len}: correct ICV must fold to the residue");
+            for bit in 0..32 {
+                let mut bad = whole.clone();
+                bad[len + bit / 8] ^= 1 << (bit % 8);
+                assert_ne!(crc32(&bad), RESIDUE, "len {len}: a wrong ICV (bit {bit}) must not fold to the residue");
+            }
+            if len > 0 {
+                let mut bad = whole.clone();
+                bad[len / 2] ^= 0x80;
+                assert_ne!(crc32(&bad), RESIDUE, "len {len}: a corrupted body must not fold to the residue");
+            }
+        }
+    }
 
     // Canonical IEEE CRC-32 (zlib) known-answer vectors. These are the same
     // values aircrack-ng's CRC computes; matching them is matching the oracle.

@@ -13,7 +13,8 @@
 //! (FR-CORRECT-1).
 #![allow(
     clippy::indexing_slicing,
-    reason = "RC4 state is a 256-octet permutation indexed by u8-derived values that are in range by construction"
+    clippy::cast_possible_truncation,
+    reason = "RC4 state is a 256-octet permutation indexed by octet-derived values that are in range by construction; the lane kernel holds those octets in u32 slots, so narrowing one back to u8 is exact"
 )]
 
 /// An RC4 keystream generator: the 256-octet permutation state plus the two
@@ -42,11 +43,17 @@ impl Rc4 {
         for (slot, val) in state.iter_mut().zip(0u8..=255) {
             *slot = val;
         }
-        // KSA: scramble the permutation under the key.
+        // KSA: scramble the permutation under the key. The key index wraps with a
+        // counter rather than `i % key.len()`, which would cost a division per step.
         let mut j: u8 = 0;
+        let mut k = 0usize;
         for i in 0..256usize {
-            j = j.wrapping_add(state[i]).wrapping_add(key[i % key.len()]);
+            j = j.wrapping_add(state[i]).wrapping_add(key[k]);
             state.swap(i, usize::from(j));
+            k += 1;
+            if k == key.len() {
+                k = 0;
+            }
         }
         Self { state, i: 0, j: 0 }
     }
@@ -88,69 +95,137 @@ impl Rc4 {
     }
 }
 
+/// `u32` slots per lane: the 256-entry permutation plus padding.
+///
+/// The padding makes the lane stride 1088 octets, so the same index in two
+/// different lanes never shares its low 12 address bits. With an unpadded
+/// 1024-octet stride, lane `n` and lane `n + 4` sit exactly 4 KiB apart, and
+/// every store to one falsely aliases the next load from the other (the CPU
+/// compares only the low address bits before the full address is known),
+/// stalling the lanes the interleaving is meant to overlap.
+const LANE_STRIDE: usize = 272;
+
+/// The identity permutation `0..=255` in lane layout (the padding stays zero).
+const IDENTITY: [u32; LANE_STRIDE] = {
+    let mut lane = [0u32; LANE_STRIDE];
+    let mut v = 0u32;
+    while v < 256 {
+        lane[v as usize] = v;
+        v += 1;
+    }
+    lane
+};
+
+/// `L` independent RC4 streams advanced in lock-step, lane-interleaved (FR-SIMD-2).
+///
+/// A single RC4 stream is bound by latency, not throughput: each step's S-box load
+/// has to wait on the previous step's data-dependent store. Interleaving the same
+/// step across independent lanes lets the CPU overlap those waits (cross-lane
+/// instruction-level parallelism), which is where the speed comes from -- the
+/// arithmetic is the plain scalar KSA/PRGA, so every lane is byte-identical to its
+/// own [`Rc4`] stream on every dispatch tier (the FR-SIMD-2 gate).
+///
+/// The permutation is held one octet per `u32` slot: byte-wide loads and stores
+/// measured markedly slower here than word-wide ones, and the padded stride
+/// (`LANE_STRIDE`) keeps lanes from aliasing each other. Vectorising the S-box
+/// itself was evaluated and rejected -- the KSA is a data-dependent gather/scatter
+/// that x86 `vpgatherdd`/`vpscatterdd` execute one element per micro-op.
+///
+/// Two callers batch through it: the brute's known-plaintext prefilter (one
+/// candidate key per lane, [`keystream_prefix_batch`]) and the verifier (one
+/// retained frame per lane under a single candidate key, `crate::wep::verify`).
+#[derive(Debug, Clone)]
+pub struct Rc4Lanes<const L: usize> {
+    /// Each lane's permutation, one octet per `u32` slot.
+    s: [[u32; LANE_STRIDE]; L],
+    /// Each lane's PRGA swap index.
+    j: [u32; L],
+    /// The PRGA output index, shared because the lanes advance together.
+    i: u32,
+}
+
+impl<const L: usize> Rc4Lanes<L> {
+    /// Key-schedule the first `lanes` lanes, lane `n` under `seeds[n][..seed_len]`.
+    ///
+    /// For WEP each seed is `IV(3) || secret`, so `seed_len` is 8, 16, or 32. It
+    /// must be in `1..=S`; lanes at or past `lanes` are left unscheduled and must
+    /// not be read.
+    #[must_use]
+    pub fn schedule<const S: usize>(seeds: &[[u8; S]; L], seed_len: usize, lanes: usize) -> Self {
+        debug_assert!((1..=S).contains(&seed_len), "RC4 seed length must be in 1..=S");
+        let lanes = lanes.min(L);
+        let mut s = [IDENTITY; L];
+        let mut j = [0u32; L];
+        // The seed index wraps with a counter shared by every lane (all seeds have
+        // the same length), so no step pays for a division.
+        let mut k = 0usize;
+        for i in 0..256usize {
+            for lane in 0..lanes {
+                let si = s[lane][i];
+                let jn = j[lane].wrapping_add(si).wrapping_add(u32::from(seeds[lane][k])) & 0xff;
+                j[lane] = jn;
+                let sj = s[lane][jn as usize];
+                s[lane][i] = sj;
+                s[lane][jn as usize] = si;
+            }
+            k += 1;
+            if k >= seed_len {
+                k = 0;
+            }
+        }
+        Self { s, j: [0u32; L], i: 0 }
+    }
+
+    /// Write the next `len` keystream octets of each lane in `lanes` to the front
+    /// of that lane's row in `out` (`len` is capped at `B`).
+    ///
+    /// The lanes share one output index, so every lane still in use must be
+    /// advanced by every call. A caller may stop advancing lanes it has finished
+    /// with -- the verifier drops each frame as it ends -- but a dropped lane is
+    /// then out of step and must not be resumed.
+    pub fn keystream<const B: usize>(&mut self, lanes: core::ops::Range<usize>, out: &mut [[u8; B]; L], len: usize) {
+        let (first, last) = (lanes.start, lanes.end.min(L));
+        let mut i = self.i;
+        for b in 0..len.min(B) {
+            i = i.wrapping_add(1) & 0xff;
+            let ii = i as usize;
+            // Lane is the inner loop so the streams stay interleaved.
+            for ((s, j), row) in self.s.iter_mut().zip(&mut self.j).zip(out.iter_mut()).take(last).skip(first) {
+                let si = s[ii];
+                let jn = j.wrapping_add(si) & 0xff;
+                *j = jn;
+                let sj = s[jn as usize];
+                s[ii] = sj;
+                s[jn as usize] = si;
+                row[b] = s[(si.wrapping_add(sj) & 0xff) as usize] as u8;
+            }
+        }
+        self.i = i;
+    }
+}
+
 /// Batched RC4 keystream prefix for `LANES` independent WEP-40 seeds (FR-SIMD-2).
 ///
 /// Each seed is the 8-octet WEP-40 RC4 seed `IV(3) || secret(5)`. The KSA and the
-/// first `PFX` PRGA octets are produced for all `LANES` seeds with the per-lane
-/// steps interleaved: lane `n`'s S-box is independent of every other lane's, so
-/// the inner loop issues `LANES` independent data-dependent loads/stores that the
-/// CPU overlaps, hiding the serial S-box latency that bounds a single scalar
-/// stream (cross-lane instruction-level parallelism). The output is byte-identical
-/// to `LANES` separate `Rc4::new(seed).keystream(prefix)` calls -- it *is* the
-/// same scalar KSA/PRGA, only lane-interleaved -- so the byte-exact gate
-/// (FR-SIMD-2) holds on every dispatch tier.
+/// first `PFX` PRGA octets are produced for all `LANES` seeds on [`Rc4Lanes`], so
+/// the output is byte-identical to `LANES` separate `Rc4::new(seed).keystream(prefix)`
+/// calls on every dispatch tier (`crate::simd::rc4_prefix_batch`).
 ///
 /// Only `PFX` octets are produced per lane because this backs the brute's
 /// known-plaintext prefilter (`crate::attack::brute`): RC4's 256-step KSA
 /// dominates a WEP-40 keystream and almost every candidate key is rejected on the
 /// leading octets, so the full frame keystream is never generated for the rejected
-/// majority. Vectorising the S-box itself was evaluated and rejected -- the KSA is
-/// a data-dependent gather/scatter that x86 `vpgatherdd`/`vpscatterdd` execute one
-/// element per micro-op, no faster than the scalar lanes -- so the kernel is one
-/// portable form the SIMD tiers share (`crate::simd::rc4_prefix_batch`).
-#[allow(
-    clippy::needless_range_loop,
-    reason = "the PRGA step index drives all lanes together; lane must be the inner loop to keep the streams interleaved for ILP, so the index cannot become an iterator over one output array"
-)]
+/// majority.
 pub fn keystream_prefix_batch<const LANES: usize, const PFX: usize>(
     seeds: &[[u8; 8]; LANES],
     out: &mut [[u8; PFX]; LANES],
 ) {
-    // Identity permutation per lane.
-    let mut s = [[0u8; 256]; LANES];
-    for lane in &mut s {
-        for (slot, val) in lane.iter_mut().zip(0u8..=255) {
-            *slot = val;
-        }
-    }
-    // KSA, lanes interleaved so their dependent S-box accesses overlap. The seed
-    // length is 8 (WEP-40), so `i % 8` is the cheap `i & 7`.
-    let mut j = [0u8; LANES];
-    for i in 0..256usize {
-        for lane in 0..LANES {
-            j[lane] = j[lane].wrapping_add(s[lane][i]).wrapping_add(seeds[lane][i & 7]);
-            s[lane].swap(i, usize::from(j[lane]));
-        }
-    }
-    // PRGA, lanes interleaved: the first PFX keystream octets per lane.
-    let mut pi = [0u8; LANES];
-    let mut pj = [0u8; LANES];
-    for k in 0..PFX {
-        for lane in 0..LANES {
-            pi[lane] = pi[lane].wrapping_add(1);
-            let ii = usize::from(pi[lane]);
-            pj[lane] = pj[lane].wrapping_add(s[lane][ii]);
-            let jj = usize::from(pj[lane]);
-            s[lane].swap(ii, jj);
-            let sum = s[lane][ii].wrapping_add(s[lane][jj]);
-            out[lane][k] = s[lane][usize::from(sum)];
-        }
-    }
+    Rc4Lanes::<LANES>::schedule(seeds, 8, LANES).keystream(0..LANES, out, PFX);
 }
 
 #[cfg(test)]
 mod tests {
-    use super::Rc4;
+    use super::{Rc4, Rc4Lanes};
 
     fn keystream_of(key: &[u8], n: usize) -> Vec<u8> {
         let mut ks = vec![0u8; n];
@@ -185,5 +260,54 @@ mod tests {
         assert_ne!(&buf, plain);
         Rc4::new(b"\x01\x02\x03KEYBYTES").apply_keystream(&mut buf);
         assert_eq!(&buf, plain);
+    }
+
+    // FR-SIMD-2: every lane equals its own scalar stream, for each WEP seed length
+    // (8 / 16 / 32 octets) and for a non-power-of-two length, across a block
+    // boundary of the 256-step output index.
+    #[test]
+    fn lanes_match_scalar_streams() {
+        for seed_len in [8usize, 16, 32, 11] {
+            let mut seeds = [[0u8; 32]; 8];
+            for (lane, seed) in seeds.iter_mut().enumerate() {
+                for (pos, octet) in seed.iter_mut().enumerate() {
+                    *octet = (lane * 37 + pos * 11 + seed_len) as u8;
+                }
+            }
+            let mut lanes = Rc4Lanes::<8>::schedule(&seeds, seed_len, 8);
+            let mut got = [[0u8; 300]; 8];
+            // Two calls, so the shared output index carries across them and wraps.
+            lanes.keystream(0..8, &mut got, 300);
+            let mut more = [[0u8; 300]; 8];
+            lanes.keystream(0..8, &mut more, 77);
+            for (lane, seed) in seeds.iter().enumerate() {
+                let want = keystream_of(&seed[..seed_len], 377);
+                assert_eq!(got[lane][..], want[..300], "lane {lane} seed_len {seed_len}");
+                assert_eq!(more[lane][..77], want[300..], "lane {lane} seed_len {seed_len} (continued)");
+            }
+        }
+    }
+
+    // A caller may schedule fewer lanes than the kernel holds and retire lanes from
+    // the front as it goes (the verifier does, frame by frame); the lanes still in
+    // use must keep matching their scalar streams.
+    #[test]
+    fn partial_and_retiring_lanes_match_scalar_streams() {
+        let mut seeds = [[0u8; 8]; 8];
+        for (lane, seed) in seeds.iter_mut().enumerate() {
+            *seed = [1, 2, 3, lane as u8, 0x5a, 0xc3, lane as u8 ^ 0xff, 9];
+        }
+        let mut lanes = Rc4Lanes::<8>::schedule(&seeds, 8, 5);
+        let mut first = [[0u8; 64]; 8];
+        lanes.keystream(0..5, &mut first, 40);
+        let mut second = [[0u8; 64]; 8];
+        lanes.keystream(2..5, &mut second, 64); // lanes 0 and 1 retired
+        for (lane, seed) in seeds.iter().enumerate().take(5) {
+            let want = keystream_of(seed, 104);
+            assert_eq!(first[lane][..40], want[..40], "lane {lane}");
+            if lane >= 2 {
+                assert_eq!(second[lane][..], want[40..], "lane {lane} after retiring 0 and 1");
+            }
+        }
     }
 }

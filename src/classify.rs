@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::ieee80211::frame::{MacHeader, TYPE_DATA, TYPE_MANAGEMENT};
 use crate::ieee80211::ie::{OUI_WFA, iter_ies, vendor_ie_body};
-use crate::model::{BssidWep, EncFrame, IvSample, Mac};
+use crate::model::{BssidWep, EncFrame, IvSample, KnownPrefix, Mac};
 use crate::types::trim_nul_padding;
 use crate::wep;
 
@@ -53,6 +53,13 @@ const IE_CHALLENGE: u8 = 16;
 const AUTH_SHARED_KEY: u16 = 1;
 /// Authentication Transaction Sequence Number of the challenge frame (frame 2).
 const AUTH_SEQ_CHALLENGE: u16 = 2;
+
+/// The first four plaintext octets of a WEP-encrypted Shared-Key authentication
+/// frame 3: Authentication Algorithm Number 1 (Shared Key) and Authentication
+/// Transaction Sequence Number 3, both little-endian. §7.2.3.10, §7.3.1.1,
+/// §7.3.1.2 ([IEEE 802.11-2024] §9.3.3.11, §9.4.1.1, §9.4.1.2); frame 3 is the
+/// only authentication frame WEP encapsulates (§8.2.2.3).
+const AUTH3_KNOWN: [u8; 4] = [0x01, 0x00, 0x03, 0x00];
 
 /// LLC/SNAP header (RFC 1042) plus the high octet of the `EtherType` (`0x08` for
 /// IP and ARP): the known-plaintext prefix of a WEP data MSDU. Seven octets of
@@ -161,26 +168,59 @@ fn ipv6_nd_known_plaintext(payload_len: usize) -> Option<[u8; IPV6_ND_KNOWN_LEN]
 /// Filled from the cleartext frame 2, consumed by the WEP-encrypted frame 3. Keyed by BSSID rather than by client because the client is `addr1` in frame 2 but `addr2` in frame 3, so an `(ap, sta)` key would never match across the two frames.
 pub type ChallengeCache = HashMap<Mac, Vec<u8>>;
 
+/// What the capture holds of one WEP MPDU, which decides what may be mined from it.
+///
+/// WEP encapsulates each MPDU on its own -- its own IV, its own ICV ([IEEE
+/// 802.11-2007] §8.2.1.2) -- so every fragment of a fragmented MSDU is a WEP frame
+/// in its own right, and a capture taken with a snap length holds only the front
+/// of the longer ones. Neither is safe to treat as an ordinary whole frame.
+#[derive(Debug, Clone, Copy)]
+struct Extent {
+    /// The Fragment Number is 0 ([IEEE 802.11-2024] §9.2.4.4.4), so the body opens
+    /// with the MSDU's LLC/SNAP header. A later fragment starts mid-packet: it has
+    /// no known plaintext at all, and mining it as if it had would only add noise.
+    first_fragment: bool,
+    /// The body is one whole MSDU as transmitted: the first fragment, More
+    /// Fragments clear (§9.2.4.1.5), and not cut short by the capture. Only then
+    /// is its length the MSDU's length, which the ARP test and the reconstructed
+    /// IPv4 / IPv6 length fields are built on.
+    whole_msdu: bool,
+    /// The capture holds the body to its last octet, so the trailing four octets
+    /// really are the ICV and the frame can confirm a key. A frame cut short at a
+    /// snap length never can, however long the key search runs.
+    complete: bool,
+}
+
+impl Extent {
+    /// The extent of the frame under `hdr`; `truncated` is whether the capture cut
+    /// the packet short (captured length below the original length).
+    const fn of(hdr: &MacHeader, truncated: bool) -> Self {
+        let first_fragment = hdr.fragment_number == 0;
+        Self { first_fragment, whole_msdu: first_fragment && !hdr.more_fragments && !truncated, complete: !truncated }
+    }
+}
+
 /// Fold one parsed frame into the BSSID map, harvesting WEP material and classification evidence.
 ///
-/// Only Beacon/Probe-Response, Authentication, and Protected data frames carry signal; everything else is ignored here.
+/// Only Beacon/Probe-Response, Authentication, and Protected data frames carry signal; everything else is ignored here. `truncated` is whether the capture cut the packet short (`crate::input::Packet::missing`): such a frame is still counted and still gives up its IV and leading keystream, but it is never retained for the verifier.
 pub fn observe(
     map: &mut BTreeMap<Mac, BssidWep>,
     challenges: &mut ChallengeCache,
     hdr: &MacHeader,
     body: &[u8],
+    truncated: bool,
 ) -> Carve {
     if hdr.frame_type == TYPE_MANAGEMENT {
         if hdr.subtype == SUBTYPE_BEACON || hdr.subtype == SUBTYPE_PROBE_RESP {
             observe_beacon(entry(map, hdr.ap), body);
             Carve::Beacon
         } else if hdr.subtype == SUBTYPE_AUTH {
-            observe_auth(map, challenges, hdr, body)
+            observe_auth(map, challenges, hdr, body, !truncated)
         } else {
             Carve::Skip
         }
     } else if hdr.frame_type == TYPE_DATA && hdr.protected {
-        observe_protected_data(entry(map, hdr.ap), hdr.dst, body)
+        observe_protected_data(entry(map, hdr.ap), hdr.dst, Extent::of(hdr, truncated), body)
     } else {
         Carve::Skip
     }
@@ -247,7 +287,13 @@ fn observe_beacon(record: &mut BssidWep, body: &[u8]) {
 /// Split WEP vs TKIP/CCMP on the Extended-IV bit (FR-WEP-1) and, for WEP, harvest
 /// the IV sample (SNAP keystream, plus a longer protocol keystream -- FR-WEP-3,
 /// FR-WEP-6), the Key ID (FR-WEP-5), and a verifier frame.
-fn observe_protected_data(record: &mut BssidWep, dst: Mac, body: &[u8]) -> Carve {
+///
+/// What is harvested depends on how much of the MSDU this frame is (`extent`,
+/// FR-PARSE-3). Every WEP frame is counted and has its Key ID recorded. Known
+/// plaintext is mined only from a first fragment; the length-derived kind only
+/// from a whole MSDU; and only a frame captured to its last octet is retained for
+/// the verifier.
+fn observe_protected_data(record: &mut BssidWep, dst: Mac, extent: Extent, body: &[u8]) -> Carve {
     let Some(view) = wep::parse(body) else {
         return Carve::Skip;
     };
@@ -259,67 +305,83 @@ fn observe_protected_data(record: &mut BssidWep, dst: Mac, body: &[u8]) -> Carve
     record.wep_data_frames += 1;
     record.key_ids_seen |= 1u8 << view.key_id;
 
-    // Short keystream from the LLC/SNAP prefix (always present) -> FMS / KoreK.
-    record
-        .material_mut()
-        .ivs
-        .push(IvSample::new(view.iv, &xor_prefix(view.payload, &SNAP_PREFIX)).with_key_id(view.key_id));
-
-    // Longer PTW keystream from known plaintext. ARP is detected by its fixed MSDU
-    // length; otherwise the cleartext Destination Address picks the L3 family
-    // (FR-WEP-6) -- IPv6 (Neighbor Discovery) and EAPOL would be mis-keyed by the
-    // IPv4-shaped guess, while IPv4 multicast/broadcast and ordinary unicast use the
-    // reconstructed IPv4 header. This is what lets PTW reach WEP-104, which the
-    // 7-octet SNAP alone cannot (FR-ATK-PTW-1).
-    let msdu_len = view.payload.len().checked_sub(4);
-    if msdu_len.is_some_and(|n| ARP_MSDU_LENS.contains(&n)) {
+    if extent.first_fragment {
+        note_known_prefix(record, view.iv, view.payload, wep::verify::SNAP_KNOWN);
+        // Short keystream from the LLC/SNAP prefix -> FMS / KoreK.
         record
             .material_mut()
-            .arp_keystreams
-            .push(IvSample::new(view.iv, &xor_prefix(view.payload, &ARP_KNOWN)).with_key_id(view.key_id));
-    } else {
-        match dst_hint(dst) {
-            DstHint::Ipv6 => {
-                // IPv6 ND / `ICMPv6`: a long, checksum-free, highly-predictable header.
-                if let Some(known) = ipv6_nd_known_plaintext(view.payload.len()) {
-                    record
-                        .material_mut()
-                        .arp_keystreams
-                        .push(IvSample::new(view.iv, &xor_prefix(view.payload, &known)).with_key_id(view.key_id));
-                }
-            },
-            DstHint::Eapol => {
-                // 802.1X: only the SNAP + `EtherType` is reliably fixed.
-                record
-                    .material_mut()
-                    .arp_keystreams
-                    .push(IvSample::new(view.iv, &xor_prefix(view.payload, &EAPOL_KNOWN)).with_key_id(view.key_id));
-            },
-            DstHint::Ipv4 | DstHint::Unknown => {
-                // IPv4 (multicast/broadcast confirmed, or a unicast guess). The
-                // Don't-Fragment octet (keystream index 14) is dual-valued, so mark
-                // it for two-keystream voting (FR-WEP-3).
-                if let Some(ip_known) = ip_known_plaintext(view.payload.len()) {
-                    record.material_mut().arp_keystreams.push(
-                        IvSample::new_ip(view.iv, &xor_prefix(view.payload, &ip_known), IP_DF_INDEX)
-                            .with_key_id(view.key_id),
-                    );
-                }
-            },
+            .ivs
+            .push(IvSample::new(view.iv, &xor_prefix(view.payload, &SNAP_PREFIX)).with_key_id(view.key_id));
+        // Longer PTW keystream from known plaintext. This is what lets PTW reach
+        // WEP-104, which the 7-octet SNAP alone cannot (FR-ATK-PTW-1).
+        if let Some(sample) = long_sample(&view, dst, extent.whole_msdu) {
+            record.material_mut().arp_keystreams.push(sample.with_key_id(view.key_id));
         }
     }
 
-    record.retain_enc_frame(EncFrame { iv: view.iv, data: view.payload.to_vec(), key_id: view.key_id });
+    if extent.complete {
+        record.retain_enc_frame(EncFrame { iv: view.iv, data: view.payload.to_vec(), key_id: view.key_id });
+    }
     Carve::Wep
+}
+
+/// The longer known-plaintext sample for a first-fragment WEP data frame, if any.
+///
+/// For a whole MSDU, ARP is detected by its fixed MSDU length; otherwise the
+/// cleartext Destination Address picks the L3 family (FR-WEP-6) -- IPv6 (Neighbor
+/// Discovery) and EAPOL would be mis-keyed by the IPv4-shaped guess, while IPv4
+/// multicast/broadcast and ordinary unicast use the reconstructed IPv4 header.
+///
+/// When the frame is not a whole MSDU (`whole_msdu` clear: more fragments follow,
+/// or the capture cut it short) its length is not the MSDU's, so nothing that
+/// leans on that length is used -- not the ARP length test, not the IPv4 Total
+/// Length or the IPv6 Payload Length. Only EAPOL's prefix, which is fixed octets
+/// and no length, still applies.
+fn long_sample(view: &wep::WepView<'_>, dst: Mac, whole_msdu: bool) -> Option<IvSample> {
+    let hint = dst_hint(dst);
+    if !whole_msdu {
+        return (hint == DstHint::Eapol).then(|| IvSample::new(view.iv, &xor_prefix(view.payload, &EAPOL_KNOWN)));
+    }
+    let msdu_len = view.payload.len().checked_sub(4);
+    if msdu_len.is_some_and(|n| ARP_MSDU_LENS.contains(&n)) {
+        return Some(IvSample::new(view.iv, &xor_prefix(view.payload, &ARP_KNOWN)));
+    }
+    match hint {
+        // IPv6 ND / `ICMPv6`: a long, checksum-free, highly-predictable header.
+        DstHint::Ipv6 => ipv6_nd_known_plaintext(view.payload.len())
+            .map(|known| IvSample::new(view.iv, &xor_prefix(view.payload, &known))),
+        // 802.1X: only the SNAP + `EtherType` is reliably fixed.
+        DstHint::Eapol => Some(IvSample::new(view.iv, &xor_prefix(view.payload, &EAPOL_KNOWN))),
+        // IPv4 (multicast/broadcast confirmed, or a unicast guess). The
+        // Don't-Fragment octet (keystream index 14) is dual-valued, so mark it for
+        // two-keystream voting (FR-WEP-3).
+        DstHint::Ipv4 | DstHint::Unknown => ip_known_plaintext(view.payload.len())
+            .map(|known| IvSample::new_ip(view.iv, &xor_prefix(view.payload, &known), IP_DF_INDEX)),
+    }
+}
+
+/// Record the brute's known-plaintext anchor from this frame unless one is
+/// already held: `payload` is the encrypted body, `plain` its standard-fixed first
+/// four plaintext octets. The first qualifying frame wins, so the choice is fixed
+/// by capture order.
+fn note_known_prefix(record: &mut BssidWep, iv: [u8; 3], payload: &[u8], plain: [u8; 4]) {
+    if record.known_prefix().is_none()
+        && let Some(prefix) = KnownPrefix::from_known_plaintext(iv, payload, plain)
+    {
+        record.material_mut().known_prefix = Some(prefix);
+    }
 }
 
 /// Handle a Shared-Key authentication frame (FR-WEP-4): cache the cleartext
 /// frame-2 challenge, or recover keystream from the WEP-encrypted frame 3.
+/// `complete` is whether the capture holds the frame to its last octet; a frame
+/// cut short still leaks its keystream but is not retained for the verifier.
 fn observe_auth(
     map: &mut BTreeMap<Mac, BssidWep>,
     challenges: &mut ChallengeCache,
     hdr: &MacHeader,
     body: &[u8],
+    complete: bool,
 ) -> Carve {
     if hdr.protected {
         let Some(view) = wep::parse(body) else {
@@ -329,6 +391,9 @@ fn observe_auth(
         record.saw_wep_auth = true;
         record.wep_auth_frames += 1;
         record.key_ids_seen |= 1u8 << view.key_id;
+        // The frame is retained for the verifier below, but its body opens with the
+        // authentication fields rather than LLC/SNAP -- anchor the brute on those.
+        note_known_prefix(record, view.iv, view.payload, AUTH3_KNOWN);
         if let Some(challenge) = challenges.get(&hdr.ap) {
             // Known plaintext of frame 3: alg=1, seq=3, status=0, Challenge IE, challenge bytes.
             let mut known =
@@ -342,7 +407,10 @@ fn observe_auth(
                 record.material_mut().ska_keystream = Some(keystream);
             }
         }
-        record.retain_enc_frame(EncFrame { iv: view.iv, data: view.payload.to_vec(), key_id: view.key_id });
+        // Only a frame captured to its last octet has an ICV to check.
+        if complete {
+            record.retain_enc_frame(EncFrame { iv: view.iv, data: view.payload.to_vec(), key_id: view.key_id });
+        }
     } else {
         // Cleartext auth body: alg(2) seq(2) status(2) [Challenge IE]. Only Shared-Key
         // auth (alg=1) belongs to a WEP network; Open System auth (alg=0) does not.
@@ -422,9 +490,81 @@ mod tests {
         let mut map = BTreeMap::new();
         let mut challenges = ChallengeCache::new();
         for (h, body) in frames {
-            observe(&mut map, &mut challenges, h, body);
+            observe(&mut map, &mut challenges, h, body, false);
         }
         map
+    }
+
+    /// A WEP data body: IV + Key-ID octet + `payload_len` octets of ciphertext.
+    fn wep_data_body(iv: [u8; 3], payload_len: usize) -> Vec<u8> {
+        let mut body = vec![iv[0], iv[1], iv[2], 0x00];
+        body.extend((0..payload_len).map(|i| (i as u8).wrapping_mul(7).wrapping_add(1)));
+        body
+    }
+
+    #[test]
+    fn later_fragment_is_counted_and_kept_but_not_mined() {
+        // FR-PARSE-3, FR-WEP-3: a fragment past the first is a WEP MPDU with its own IV
+        // and ICV -- it counts, and it can confirm a key -- but its body starts
+        // mid-packet, so it yields no IV sample and no brute anchor.
+        let ap = Mac::from_bytes([3; 6]);
+        let mut later = hdr(ap, Mac::default(), TYPE_DATA, 0, true);
+        later.fragment_number = 1;
+        let r = &run(&[(later, wep_data_body([1, 2, 3], 60))])[&ap];
+        assert_eq!(r.wep_data_frames, 1, "still a WEP frame");
+        assert_eq!(r.encryption(), Encryption::Wep);
+        assert!(r.ivs().is_empty() && r.arp_keystreams().is_empty(), "no known plaintext to mine");
+        assert_eq!(r.enc_frames().len(), 1, "its ICV still verifies a key");
+        assert!(r.known_prefix().is_none(), "and it must not anchor the brute prefilter");
+    }
+
+    #[test]
+    fn first_fragment_with_more_to_come_yields_only_the_snap_sample() {
+        // FR-PARSE-3, FR-WEP-3: the first fragment opens with LLC/SNAP, but its length
+        // is the fragment's, not the MSDU's -- so the ARP length test and the IPv4
+        // total-length reconstruction do not apply. (36 is the bare ARP MSDU length.)
+        let ap = Mac::from_bytes([4; 6]);
+        let mut first = hdr(ap, Mac::default(), TYPE_DATA, 0, true);
+        first.more_fragments = true;
+        let r = &run(&[(first, wep_data_body([1, 2, 3], 40))])[&ap];
+        assert_eq!(r.ivs().len(), 1, "SNAP sample harvested");
+        assert!(r.arp_keystreams().is_empty(), "nothing derived from the fragment's length");
+        assert!(r.known_prefix().is_some(), "the first fragment anchors the brute prefilter");
+        // The same body as a whole MSDU is taken for ARP.
+        let whole = &run(&[(hdr(ap, Mac::default(), TYPE_DATA, 0, true), wep_data_body([1, 2, 3], 40))])[&ap];
+        assert_eq!(whole.arp_keystreams().len(), 1);
+    }
+
+    #[test]
+    fn frame_cut_short_by_the_capture_is_never_a_verifier_frame() {
+        // FR-WEP-3, FR-CORRECT-1: a frame the capture cut short has lost its ICV, so
+        // retaining it for the verifier would hold a slot no key can ever satisfy.
+        // Its IV and SNAP keystream are intact and still harvested; its length is not
+        // the MSDU's, so no length-derived plaintext is.
+        let ap = Mac::from_bytes([5; 6]);
+        let mut map = BTreeMap::new();
+        let mut challenges = ChallengeCache::new();
+        let h = hdr(ap, Mac::default(), TYPE_DATA, 0, true);
+        observe(&mut map, &mut challenges, &h, &wep_data_body([1, 2, 3], 40), true);
+        let r = &map[&ap];
+        assert_eq!(r.wep_data_frames, 1);
+        assert_eq!(r.ivs().len(), 1, "IV + SNAP keystream still harvested");
+        assert!(r.arp_keystreams().is_empty(), "length-derived plaintext skipped");
+        assert!(r.enc_frames().is_empty(), "no ICV, so not retained for the verifier");
+        // A complete frame afterwards is retained as usual.
+        observe(&mut map, &mut challenges, &h, &wep_data_body([4, 5, 6], 40), false);
+        assert_eq!(map[&ap].enc_frames().len(), 1);
+    }
+
+    #[test]
+    fn eapol_prefix_survives_a_partial_frame() {
+        // FR-WEP-6: the EAPOL prefix is fixed octets, not a length, so it is still
+        // mined from a frame that is not a whole MSDU.
+        let ap = Mac::from_bytes([6; 6]);
+        let dst = Mac::from_bytes([0x01, 0x80, 0xc2, 0x00, 0x00, 0x03]);
+        let mut map = BTreeMap::new();
+        observe(&mut map, &mut ChallengeCache::new(), &data_hdr_to(ap, dst), &wep_data_body([9, 9, 9], 30), true);
+        assert_eq!(map[&ap].arp_keystreams().len(), 1);
     }
 
     #[test]

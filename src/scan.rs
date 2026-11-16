@@ -278,7 +278,10 @@ fn process_packet(
                 stats.truncated += 1;
                 return;
             };
-            let kind = classify::observe(bssids, challenges, &hdr, body);
+            // A packet the capture cut short still yields an IV and its leading
+            // keystream, but not a verifiable ICV or a trustworthy length.
+            let missing = packet.missing();
+            let kind = classify::observe(bssids, challenges, &hdr, body, missing > 0);
             // Carve (FR-OUT-6): write WEP crack frames now; buffer beacons for the
             // BSSID, written later only if it classifies WEP. The writer is shared
             // across workers, so lock only when there is a frame to write (never on
@@ -287,7 +290,10 @@ fn process_packet(
             if let Some(carver) = carve {
                 match kind {
                     Carve::Wep => {
-                        carver.lock().unwrap_or_else(std::sync::PoisonError::into_inner).wep_frame(frame_bytes);
+                        carver
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .wep_frame(frame_bytes, missing);
                     },
                     Carve::Beacon => {
                         carver.lock().unwrap_or_else(std::sync::PoisonError::into_inner).beacon(hdr.ap, frame_bytes);
@@ -312,9 +318,21 @@ fn strip_and_resolve<'a>(
 ) -> Option<&'a [u8]> {
     match link::strip(&packet.data, dlt) {
         Ok((payload, header_says_fcs)) => {
-            let badfcs = dlt == link::DLT_RADIOTAP && link::radiotap::has_badfcs(&packet.data);
-            let outcome = link::fcs::resolve(payload, header_says_fcs, badfcs);
-            Some(link::fcs::strip_fcs(payload, outcome))
+            // A control frame is only counted: `frame::parse` classifies it from the
+            // Frame Control field alone and nothing reads its body, so whether a
+            // trailing FCS is stripped cannot change its disposition. Skip the FCS
+            // decision -- a CRC-32 pass per frame -- for what is typically half the
+            // packets of a capture.
+            if is_counted_only(payload) {
+                return Some(payload);
+            }
+            // Only the strip decision matters here (no per-outcome FCS accounting),
+            // so the CRC runs only when the header does not already settle it. The
+            // FCS is the tail of the frame as transmitted, so a packet the capture
+            // cut short holds less of it -- or none -- and only that much is stripped.
+            let strip = link::fcs::should_strip(payload, header_says_fcs);
+            let octets = if strip { link::fcs::fcs_octets_captured(packet.missing()) } else { 0 };
+            Some(link::fcs::strip_tail(payload, octets))
         },
         Err(e) => link::recover::recover(&packet.data, dlt).map(|r| r.frame).or_else(|| {
             stats.link_errors += 1;
@@ -324,6 +342,19 @@ fn strip_and_resolve<'a>(
             None
         }),
     }
+}
+
+/// Whether `payload` is a control frame that parses as one with or without a
+/// trailing FCS, so the FCS decision can be skipped for it.
+///
+/// The frame type is bits B2-B3 of the first Frame Control octet, per
+/// [IEEE 802.11-2007] §7.1.3.1. `frame::parse` returns `Control` for any control
+/// frame of at least two octets; requiring six here guarantees two remain even if
+/// four were stripped, so the classification is identical either way.
+fn is_counted_only(payload: &[u8]) -> bool {
+    // The shortest frame that still holds a Frame Control field after an FCS strip.
+    const MIN_LEN: usize = 6;
+    payload.len() >= MIN_LEN && payload.first().is_some_and(|fc| (fc >> 2) & 0x03 == frame::TYPE_CONTROL)
 }
 
 /// Resolve every observed BSSID to a classification and fill the BSSID + WEP-frame counters.
@@ -349,9 +380,9 @@ fn tally_bssids(bssids: &BTreeMap<Mac, BssidWep>, stats: &mut Stats) {
 /// become a one-line census instead of millions of per-BSSID lines.
 fn dump_bssid_material(debug: &DebugPrinter, bssids: &BTreeMap<Mac, BssidWep>) {
     let mut wep: Vec<&BssidWep> = bssids.values().filter(|b| b.encryption() == Encryption::Wep).collect();
-    wep.sort_by(|a, b| {
-        crate::attack::unique_iv_count(b).cmp(&crate::attack::unique_iv_count(a)).then(a.bssid.cmp(&b.bssid))
-    });
+    // Cached key: counting distinct IVs walks every sample, so do it once per
+    // BSSID rather than twice per comparison.
+    wep.sort_by_cached_key(|b| (std::cmp::Reverse(crate::attack::unique_iv_count(b)), b.bssid));
     for r in wep.iter().take(DEBUG_BSSID_ROWS) {
         debug.say(&format!(
             "bssid {} {} ivs={} arp={} ska={} wep_data={} wep_auth={}",
@@ -387,5 +418,47 @@ const fn enc_word(enc: Encryption) -> &'static str {
         Encryption::Wep => "wep",
         Encryption::Wpa => "wpa",
         Encryption::Unknown => "unknown",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_counted_only;
+    use crate::ieee80211::frame::{self, ParseResult};
+    use crate::link::fcs;
+
+    #[test]
+    fn control_fast_path_never_changes_the_disposition() {
+        // FR-PARSE-4: the control-frame fast path skips the FCS decision, so it must
+        // only fire where the parse result is `Control` both with and without the
+        // four-octet strip -- for every frame type, FCS state, and short length.
+        for fc0 in 0u8..=255 {
+            for len in 0usize..=40 {
+                let mut body = vec![0x5au8; len];
+                if let Some(first) = body.first_mut() {
+                    *first = fc0;
+                }
+                let mut with_fcs = body.clone();
+                with_fcs.extend_from_slice(&crc32fast::hash(&body).to_le_bytes());
+                for frame in [&body, &with_fcs] {
+                    if !is_counted_only(frame) {
+                        continue;
+                    }
+                    for header_says_fcs in [false, true] {
+                        let octets = if fcs::should_strip(frame, header_says_fcs) { 4 } else { 0 };
+                        let stripped = fcs::strip_tail(frame, octets);
+                        assert!(
+                            matches!(frame::parse(frame), ParseResult::Control)
+                                && matches!(frame::parse(stripped), ParseResult::Control),
+                            "fc0 {fc0:#04x} len {} header {header_says_fcs}",
+                            frame.len()
+                        );
+                    }
+                }
+            }
+        }
+        // And it does fire for an ordinary ACK (10 octets, type Control).
+        assert!(is_counted_only(&[0xd4, 0x00, 0, 0, 1, 2, 3, 4, 5, 6]));
+        assert!(!is_counted_only(&[0x80, 0x00, 0, 0, 1, 2, 3, 4, 5, 6]), "a beacon is not counted-only");
     }
 }

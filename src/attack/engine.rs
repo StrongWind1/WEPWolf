@@ -11,7 +11,7 @@ use rayon::iter::{IntoParallelRefIterator as _, ParallelIterator as _};
 use super::Attack;
 use super::brute::{key_at, search_prefiltered};
 use crate::diag::DebugPrinter;
-use crate::model::{BssidWep, Encryption, KeyLen, Mac, WepKey};
+use crate::model::{BssidWep, Encryption, KeyLen, KnownPrefix, Mac, WepKey};
 use crate::progress::Progress;
 use crate::wep::Verifier;
 
@@ -92,37 +92,38 @@ fn crack_traced(
     //
     // The divisor counts only the attacks that will actually run on this BSSID
     // (applicable at some length), so a registered-but-inapplicable attack -- SKA on
-    // a no-handshake network, dict/keygen without --wordlist -- does not shrink the
-    // slices the runnable ones receive.
-    let runnable = u32::try_from(
-        attacks.iter().filter(|a| !a.is_grind() && lengths.iter().any(|&l| a.applicable(bssid, l))).count(),
-    )
-    .unwrap_or(1)
-    .max(1);
+    // a no-handshake network, a statistical attack on a capture below its
+    // convergence floor, keygen without --wordlist -- does not shrink the slices
+    // the runnable ones receive.
+    //
+    // Applicability is resolved once per (attack, length): it depends only on this
+    // BSSID's material, and the statistical attacks answer it by counting distinct
+    // IVs across every sample -- a cost worth paying once on a rich capture, not
+    // once per pass and again for the divisor.
+    let applicable: Vec<Vec<bool>> =
+        attacks.iter().map(|a| lengths.iter().map(|&l| !a.is_grind() && a.applicable(bssid, l)).collect()).collect();
+    let runnable = u32::try_from(applicable.iter().filter(|row| row.iter().any(|&ok| ok)).count()).unwrap_or(1).max(1);
     let slice = budget.map(|b| b / runnable);
-    // Unique-IV count for the full-pass convergence gate below (computed once).
-    let ivs = super::unique_iv_count(bssid);
     for quick in [true, false] {
         super::set_quick(quick);
         let pass = if quick { "quick" } else { "full" };
-        for attack in attacks {
+        for (attack, applicable) in attacks.iter().zip(&applicable) {
             if attack.is_grind() {
+                continue;
+            }
+            // An attack that does the same work in both passes already ran, and
+            // failed, in the quick pass; repeating it cannot find a key. With a
+            // large --wordlist this is the difference between one dictionary and
+            // keygen sweep per network and two.
+            if !quick && attack.single_pass() {
                 continue;
             }
             // Quick pass shares the full budget (cheap searches); the full pass gives
             // each attack its own fresh slice so none is starved.
             let window = if quick { budget } else { slice };
             super::set_deadline(window.and_then(|w| Instant::now().checked_add(w)));
-            for &len in lengths {
-                if !attack.applicable(bssid, len) {
-                    continue;
-                }
-                // Deep ladders only where they converge: in the full pass, skip a
-                // convergence-bound attack (PTW/KoreK/bias) on a network with too few
-                // unique IVs. It already got the cheap quick pass and the dictionary /
-                // common-key checks, so this only avoids burning its budget on a
-                // hopeless backtracking search (FR-PERF-3).
-                if !quick && attack.needs_convergence() && ivs < super::min_samples(len) {
+            for (&len, &applies) in lengths.iter().zip(applicable) {
+                if !applies {
                     continue;
                 }
                 // Trace each attack start/stop (FR-DEBUG-3): a `start` with no
@@ -263,6 +264,37 @@ fn scale_budget(cap: Option<Duration>, unique_ivs: usize) -> Option<Duration> {
     })
 }
 
+/// Test already-known `keys` against every network not yet in `cracked`, crediting
+/// the first key that verifies to `attack` (`"potfile"` or `"reuse"`, FR-PERF-2).
+///
+/// On a large corpus this is millions of networks times every known key, so it
+/// runs on the pool. The keys are tried in order and the results collected in
+/// network order, so the outcome is the one a serial pass would produce
+/// regardless of thread scheduling. `elapsed` is the time spent verifying that
+/// network. Every key still passes through the `Verifier` (C4).
+fn verify_known_keys(
+    wep: &[&BssidWep],
+    cracked: &HashSet<Mac>,
+    keys: &[WepKey],
+    attack: &'static str,
+) -> Vec<CrackResult> {
+    if keys.is_empty() {
+        return Vec::new();
+    }
+    wep.par_iter()
+        .filter(|b| !cracked.contains(&b.bssid))
+        .filter_map(|b| {
+            let verifier = Verifier::new(b.enc_frames().to_vec());
+            let started = Instant::now();
+            keys.iter().find(|k| verifier.accept(k)).map(|key| {
+                let mut c = result(b, *key, attack);
+                c.elapsed = started.elapsed();
+                c
+            })
+        })
+        .collect()
+}
+
 /// Recover keys for every WEP BSSID, returning one `CrackResult` per crack.
 ///
 /// Three phases: the parallel cheap-attack *sweep* (FR-PERF-1), cross-BSSID key *reuse* (FR-PERF-2, so co-located same-key APs are cracked once), then the serialised *brute force* -- bounded by `budget` per BSSID and by `brute_budget` over the whole phase (FR-PERF-3). Each key streams to the progress surface as it verifies.
@@ -289,19 +321,13 @@ pub fn crack_all(
 
     // Phase 0: seed keys (a potfile or prior cracks) -- report a known network
     // without attacking it, the way hashcat reuses its pot.
-    if !seed_keys.is_empty() {
-        for b in &wep {
-            let verifier = Verifier::new(b.enc_frames().to_vec());
-            let started = Instant::now();
-            if let Some(key) = seed_keys.iter().find(|k| verifier.accept(k)) {
-                let mut c = result(b, *key, "potfile");
-                c.elapsed = started.elapsed();
-                sweep.println(&row(&c));
-                sweep.inc(1);
-                cracked.insert(b.bssid);
-                cracks.push(c);
-            }
-        }
+    // Every network is tested against every seed key, so this runs on the pool; the
+    // ordered collect keeps the result identical to a serial pass.
+    for c in verify_known_keys(&wep, &cracked, seed_keys, "potfile") {
+        sweep.println(&row(&c));
+        sweep.inc(1);
+        cracked.insert(c.bssid);
+        cracks.push(c);
     }
 
     // Phase 1: sweep -- each still-uncracked BSSID's cheap attacks run on the
@@ -349,21 +375,19 @@ pub fn crack_all(
     }
     sweep.finish();
 
-    // Cross-BSSID reuse: test every recovered key against the still-uncracked.
-    let found: Vec<WepKey> = cracks.iter().map(|c| c.key).collect();
-    for b in &wep {
-        if cracked.contains(&b.bssid) {
-            continue;
+    // Cross-BSSID reuse: test every recovered key against the still-uncracked. A
+    // key recovered on several networks is tried once -- the first key that verifies
+    // wins, so a later duplicate could never be chosen over its earlier copy.
+    let mut found: Vec<WepKey> = Vec::new();
+    for c in &cracks {
+        if !found.contains(&c.key) {
+            found.push(c.key);
         }
-        let verifier = Verifier::new(b.enc_frames().to_vec());
-        let started = Instant::now();
-        if let Some(key) = found.iter().find(|k| verifier.accept(k)) {
-            let mut c = result(b, *key, "reuse");
-            c.elapsed = started.elapsed();
-            sweep.println(&row(&c));
-            cracked.insert(b.bssid);
-            cracks.push(c);
-        }
+    }
+    for c in verify_known_keys(&wep, &cracked, &found, "reuse") {
+        sweep.println(&row(&c));
+        cracked.insert(c.bssid);
+        cracks.push(c);
     }
     // The recovery phase (seed + parallel attacks + reuse) is everything up to here.
     let recovery_elapsed = phase_start.elapsed();
@@ -396,7 +420,7 @@ pub fn crack_all(
                 debug.say(&format!("brute {}: start", b.bssid));
             }
             let started = Instant::now();
-            let hit = grind(b.bssid, &verifier, this_budget, progress);
+            let hit = grind(b.bssid, &verifier, b.known_prefix(), this_budget, progress);
             if debug.enabled() {
                 debug.say(&format!(
                     "brute {}: {} in {:.3}s",
@@ -419,20 +443,29 @@ pub fn crack_all(
 
 /// Brute the 40-bit space for one BSSID on the full pool, bounded by `budget`.
 ///
-/// The space is split into fixed chunks searched in parallel. A shared flag and
+/// `filter` is the known-plaintext anchor recorded at harvest
+/// (`BssidWep::known_prefix`), if any. The space is split into fixed chunks
+/// searched in parallel. A shared flag and
 /// the per-BSSID deadline are polled every `POLL` keys so that once one chunk
 /// finds the key -- or the budget runs out (FR-PERF-3) -- the in-flight chunks
 /// abandon within microseconds instead of grinding to their ends. The bar names
 /// the BSSID and reports percent / keys-per-second / ETA / SIMD tier (FR-UI-3).
-fn grind(bssid: Mac, verifier: &Verifier, budget: Option<Duration>, progress: &Progress) -> Option<WepKey> {
+fn grind(
+    bssid: Mac,
+    verifier: &Verifier,
+    filter: Option<KnownPrefix>,
+    budget: Option<Duration>,
+    progress: &Progress,
+) -> Option<WepKey> {
     const SPACE: u64 = 1 << 40;
     const CHUNK: u64 = 1 << 24; // 16.7M keys per chunk -> 65536 chunks.
     const POLL: u64 = 1 << 16; // re-check the cancel flag / deadline every 65536 keys.
     let tier = crate::simd::best();
     // The known-plaintext prefilter (FR-SIMD-2): batched RC4 rejects almost every
     // candidate on its leading keystream octets, so the full verify runs only for
-    // the rare survivor. Absent a usable frame, fall back to the scalar per-key verify.
-    let filter = verifier.prefilter();
+    // the rare survivor. `filter` is the anchor the harvester recorded from a frame
+    // whose leading plaintext is known; without one, every candidate is verified in
+    // full rather than filtered on a guess that could reject the true key.
     let deadline = budget.and_then(|d| Instant::now().checked_add(d));
     let done = AtomicBool::new(false);
     let bar = progress.brute_bar(SPACE, tier.label());
@@ -518,6 +551,151 @@ mod tests {
         let attacks: [Box<dyn Attack>; 1] = [Box::new(Recorder { seen, crack_when_full: true })];
         let result = crack(&BssidWep::default(), &Verifier::default(), &attacks, &[KeyLen::Wep40], None);
         assert!(result.is_some(), "the full pass must run after the quick pass");
+    }
+
+    /// Counts its `run` calls and declares itself pass-independent.
+    struct OnePass {
+        runs: Arc<Mutex<Vec<bool>>>,
+    }
+
+    impl Attack for OnePass {
+        fn name(&self) -> &'static str {
+            "one-pass"
+        }
+        fn applicable(&self, _bssid: &BssidWep, _len: KeyLen) -> bool {
+            true
+        }
+        fn single_pass(&self) -> bool {
+            true
+        }
+        fn run(&self, _bssid: &BssidWep, _len: KeyLen, _verifier: &Verifier) -> Option<WepKey> {
+            self.runs.lock().expect("lock").push(crate::attack::quick());
+            None
+        }
+    }
+
+    #[test]
+    fn crack_runs_a_single_pass_attack_once() {
+        // FR-ATK-1, FR-PERF-3: an attack whose search is the same in both passes (the
+        // dictionary, the keygen, FMS) is run in the quick pass only -- repeating it
+        // in the full pass would re-test the candidates that just failed. Beside it,
+        // an ordinary attack still gets both passes.
+        let once = Arc::new(Mutex::new(Vec::new()));
+        let twice = Arc::new(Mutex::new(Vec::new()));
+        let attacks: [Box<dyn Attack>; 2] = [
+            Box::new(OnePass { runs: Arc::clone(&once) }),
+            Box::new(Recorder { seen: Arc::clone(&twice), crack_when_full: false }),
+        ];
+        let result =
+            crack(&BssidWep::default(), &Verifier::default(), &attacks, &[KeyLen::Wep40, KeyLen::Wep104], None);
+        assert!(result.is_none());
+        assert_eq!(*once.lock().expect("lock"), vec![true, true], "quick pass only, once per length");
+        assert_eq!(*twice.lock().expect("lock"), vec![true, true, false, false], "both passes");
+    }
+
+    /// Counts how often the engine asks whether it applies.
+    struct Asked {
+        asked: Arc<Mutex<u32>>,
+    }
+
+    impl Attack for Asked {
+        fn name(&self) -> &'static str {
+            "asked"
+        }
+        fn applicable(&self, _bssid: &BssidWep, _len: KeyLen) -> bool {
+            *self.asked.lock().expect("lock") += 1;
+            true
+        }
+        fn run(&self, _bssid: &BssidWep, _len: KeyLen, _verifier: &Verifier) -> Option<WepKey> {
+            None
+        }
+    }
+
+    #[test]
+    fn crack_resolves_applicability_once_per_length() {
+        // FR-PERF-3: applicability depends only on the BSSID's material, and the
+        // statistical attacks answer it by counting distinct IVs over every sample,
+        // so the engine asks once per (attack, length) -- not again for each pass.
+        let asked = Arc::new(Mutex::new(0u32));
+        let attacks: [Box<dyn Attack>; 1] = [Box::new(Asked { asked: Arc::clone(&asked) })];
+        let _ = crack(&BssidWep::default(), &Verifier::default(), &attacks, &KeyLen::all(), None);
+        assert_eq!(*asked.lock().expect("lock"), 3, "one question per key length");
+    }
+
+    /// Applicable at WEP-40 only, recording the length of every `run`.
+    struct Wep40Only {
+        ran: Arc<Mutex<Vec<KeyLen>>>,
+    }
+
+    impl Attack for Wep40Only {
+        fn name(&self) -> &'static str {
+            "wep40-only"
+        }
+        fn applicable(&self, _bssid: &BssidWep, len: KeyLen) -> bool {
+            len == KeyLen::Wep40
+        }
+        fn run(&self, _bssid: &BssidWep, len: KeyLen, _verifier: &Verifier) -> Option<WepKey> {
+            self.ran.lock().expect("lock").push(len);
+            None
+        }
+    }
+
+    #[test]
+    fn crack_never_runs_an_attack_where_it_does_not_apply() {
+        // FR-OUT-5, FR-PERF-3: the convergence floor reaches the engine only through
+        // `applicable`, so the engine must honour it in both passes -- an attack is
+        // run for exactly the lengths it applies to, and never otherwise.
+        let ran = Arc::new(Mutex::new(Vec::new()));
+        let attacks: [Box<dyn Attack>; 1] = [Box::new(Wep40Only { ran: Arc::clone(&ran) })];
+        let _ = crack(&BssidWep::default(), &Verifier::default(), &attacks, &KeyLen::all(), None);
+        assert_eq!(*ran.lock().expect("lock"), vec![KeyLen::Wep40, KeyLen::Wep40], "WEP-40 in each pass, nothing else");
+    }
+
+    #[test]
+    fn known_keys_are_matched_in_network_order_and_skip_the_cracked() {
+        // FR-PERF-2: reuse and potfile seeding run on the pool, but the result must be
+        // the one a serial pass gives -- one row per network that verifies, in network
+        // order, crediting the first listed key that fits, and never touching a
+        // network that is already cracked.
+        use crate::crypto::{Rc4, crc32};
+        use crate::model::{EncFrame, Mac, WepMaterial};
+        use std::collections::HashSet;
+
+        let net = |id: u8, key: &[u8]| {
+            let enc_frames = (1..=3u8)
+                .map(|n| {
+                    let iv = [id, n, 0x33];
+                    let plain = [0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00, id, n];
+                    let mut data = plain.to_vec();
+                    data.extend_from_slice(&crc32(&plain).to_le_bytes());
+                    let mut seed = iv.to_vec();
+                    seed.extend_from_slice(key);
+                    Rc4::new(&seed).apply_keystream(&mut data);
+                    EncFrame { iv, data, key_id: 0 }
+                })
+                .collect();
+            BssidWep {
+                bssid: Mac::from_bytes([id; 6]),
+                saw_wep_data: true,
+                ..BssidWep::with_material(WepMaterial { enc_frames, ..Default::default() })
+            }
+        };
+        let (key_a, key_b, other) = ([1u8, 2, 3, 4, 5], [9u8, 8, 7, 6, 5], [0x55u8; 5]);
+        let nets = [net(1, &key_a), net(2, &key_b), net(3, &other), net(4, &key_a), net(5, &key_b)];
+        let wep: Vec<&BssidWep> = nets.iter().collect();
+        let keys = [WepKey::new(&key_b).expect("wep40"), WepKey::new(&key_a).expect("wep40")];
+        let cracked: HashSet<Mac> = std::iter::once(Mac::from_bytes([4; 6])).collect();
+
+        let found = super::verify_known_keys(&wep, &cracked, &keys, "reuse");
+        let got: Vec<(Mac, WepKey)> = found.iter().map(|c| (c.bssid, c.key)).collect();
+        let want = vec![
+            (Mac::from_bytes([1; 6]), keys[1]),
+            (Mac::from_bytes([2; 6]), keys[0]),
+            (Mac::from_bytes([5; 6]), keys[0]),
+        ];
+        assert_eq!(got, want, "network order, right key each, cracked and keyless networks left out");
+        assert!(found.iter().all(|c| c.attack == "reuse"));
+        assert!(super::verify_known_keys(&wep, &cracked, &[], "reuse").is_empty(), "no keys, nothing to verify");
     }
 
     /// Records the per-attack deadline state observed at the start of each `run`.

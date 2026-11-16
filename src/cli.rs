@@ -36,8 +36,9 @@ use crate::{carve, input, potfile, report, scan};
 ///
 /// Reads pcap, pcapng, and gzip-compressed captures, pulls the WEP-encrypted
 /// frames out of the 802.11 traffic, and recovers each network's key with every
-/// applicable attack: PTW, KoreK, FMS, the Sepehrdad RC4-bias database,
-/// dictionary and keygen (with --wordlist), and an optional 40-bit brute force.
+/// applicable attack: PTW, KoreK, FMS, the Sepehrdad RC4-bias database, a
+/// dictionary of common keys (extended by --wordlist, which also enables the
+/// keygen), and an optional 40-bit brute force.
 /// No wordlist or external cracker is required; every reported key is confirmed
 /// by RC4-decrypting real frames and checking the CRC-32 ICV. Passive and
 /// offline -- it never captures traffic, injects frames, or touches a radio.
@@ -71,12 +72,13 @@ pub struct Cli {
     ///
     /// Each line is tried three ways: as a raw key, as a hex-encoded key, and as
     /// a passphrase through the Neesus-Datacom (40-bit) and MD5 (104-bit) weak-key
-    /// generators. The statistical attacks run with or without this flag; the
-    /// wordlist only adds the dictionary and keygen paths.
+    /// generators. A built-in list of common and default keys is tried on every
+    /// network with or without this flag; the wordlist extends that list and
+    /// enables the keygen.
     #[arg(short = 'w', long, value_name = "FILE", value_hint = clap::ValueHint::FilePath, help_heading = "Targeting & attacks", display_order = 1)]
     pub wordlist: Option<PathBuf>,
 
-    /// Only try one key strength in bits: 40, 104, or 232 (default: all three).
+    /// Only try one key strength in bits (default: all three).
     ///
     /// Narrows the key-length hypotheses to a single size. By default every WEP
     /// length is tried and the statistical attacks recover the length implicitly,
@@ -91,12 +93,13 @@ pub struct Cli {
     #[arg(short = 'b', long, value_name = "MAC", help_heading = "Targeting & attacks", display_order = 3)]
     pub bssid: Option<String>,
 
-    /// Brute-force WEP-40 keys no other attack recovered (slow: scalar 2^40).
+    /// Brute-force WEP-40 keys no other attack recovered (slow: 2^40 keys).
     ///
-    /// A last-resort exhaustive sweep of the full 40-bit keyspace, run only on
-    /// networks every statistical and wordlist attack left uncracked. Off by
-    /// default; bounded by --per-bssid-time-max and by --total-brute-time-max over the
-    /// whole phase (300 s per network, unlimited total, unless raised).
+    /// A last-resort exhaustive sweep of the 40-bit keyspace, run only on networks
+    /// every statistical and wordlist attack left uncracked. Off by default. Each
+    /// network is bounded by --per-bssid-time-max, and at its 300 s default that
+    /// covers only the start of the keyspace: pass --per-bssid-time-max 0 for a
+    /// full sweep, which takes hours. --total-brute-time-max caps the whole phase.
     #[arg(long, help_heading = "Targeting & attacks", display_order = 4)]
     pub brute: bool,
 
@@ -108,7 +111,7 @@ pub struct Cli {
     #[arg(short = 'f', long, value_name = "FACTOR", help_heading = "Search tuning", display_order = 10)]
     pub fudge: Option<f32>,
 
-    /// Exhaustively sweep the last N key octets (aircrack -x; default 2, max 4).
+    /// Exhaustively sweep the last N key octets (aircrack -x; max 4).
     ///
     /// After the statistical vote fixes the strong leading octets, brute-force the
     /// N weakest trailing octets -- the unpredictable IPv4 ID/checksum octets real
@@ -140,7 +143,7 @@ pub struct Cli {
     #[arg(short = 'j', long, value_name = "N", help_heading = "Performance", display_order = 20)]
     pub threads: Option<usize>,
 
-    /// Max seconds any one network may spend in recovery and brute force (default 300).
+    /// Max seconds any one network may spend in recovery and brute force (0: unlimited).
     ///
     /// The per-network ceiling. Recovery scales a capture's share of it by unique-IV
     /// count -- a rich capture earns the full cap, a thinner one a smaller share -- and
@@ -148,7 +151,7 @@ pub struct Cli {
     #[arg(long, value_name = "SECS", default_value_t = 300, help_heading = "Performance", display_order = 21)]
     pub per_bssid_time_max: u64,
 
-    /// Max total seconds for the whole 40-bit brute-force phase (default 0: unlimited).
+    /// Max total seconds for the whole 40-bit brute-force phase (0: unlimited).
     ///
     /// Caps the entire serialised brute force across all networks, not just each one
     /// (that is --per-bssid-time-max): on a big corpus with --brute, many feasible
@@ -156,7 +159,7 @@ pub struct Cli {
     #[arg(long, value_name = "SECS", default_value_t = 0, help_heading = "Performance", display_order = 22)]
     pub total_brute_time_max: u64,
 
-    /// Max total seconds for the whole recovery phase (default 0: unlimited).
+    /// Max total seconds for the whole recovery phase (0: unlimited).
     ///
     /// Caps the parallel statistical/dictionary sweep across all networks, not just
     /// each one (that is --per-bssid-time-max): on a huge corpus, even with each
@@ -439,7 +442,9 @@ fn attack_diagnostics(debug: &DebugPrinter, bssids: &BTreeMap<Mac, BssidWep>, cr
     // million-BSSID corpus does not emit a million "why uncracked" lines.
     let mut uncracked: Vec<&BssidWep> =
         bssids.values().filter(|b| b.encryption() == Encryption::Wep && !cracked.contains_key(&b.bssid)).collect();
-    uncracked.sort_by(|a, b| attack::unique_iv_count(b).cmp(&attack::unique_iv_count(a)).then(a.bssid.cmp(&b.bssid)));
+    // Cached key: counting distinct IVs walks every sample, so do it once per
+    // BSSID rather than twice per comparison.
+    uncracked.sort_by_cached_key(|b| (std::cmp::Reverse(attack::unique_iv_count(b)), b.bssid));
     for b in uncracked.iter().take(DEBUG_ATTACK_ROWS) {
         // Unique IVs are the real material; raw frames overstate a replayed capture.
         let uniq = attack::unique_iv_count(b);

@@ -28,12 +28,13 @@ impl Attack for SkaAttack {
         "ska"
     }
 
-    /// Applicable whenever a shared-key handshake was captured: its keystream is
-    /// the bootstrap seed, so this fires even on a capture too thin for ordinary
-    /// PTW. The search simply returns nothing when the pool cannot converge, so a
-    /// handshake-only capture (one sample) is reported uncracked, not falsely.
-    fn applicable(&self, bssid: &BssidWep, _len: KeyLen) -> bool {
-        bssid.ska_keystream().is_some()
+    /// Applicable when a shared-key handshake was captured *and* the pool it joins
+    /// can converge at `len`. The handshake is one sample among the thousands the
+    /// sigma vote needs, so on a capture below the convergence floor the search
+    /// could only run to its budget and return nothing -- the same rule as PTW,
+    /// whose search this reuses.
+    fn applicable(&self, bssid: &BssidWep, len: KeyLen) -> bool {
+        bssid.ska_keystream().is_some() && super::worth_attempting(bssid, len)
     }
 
     fn run(&self, bssid: &BssidWep, len: KeyLen, verifier: &Verifier) -> Option<WepKey> {
@@ -79,13 +80,24 @@ mod tests {
     }
 
     #[test]
-    fn ska_is_applicable_only_with_a_handshake() {
+    fn ska_is_applicable_only_with_a_handshake_and_a_pool_that_can_converge() {
         // FR-ATK-SKA-1: the bootstrap fires only when a shared-key handshake was
-        // captured -- a record without one is left to the ordinary statistical path.
-        let without = BssidWep::default();
-        assert!(!SkaAttack::default().applicable(&without, KeyLen::Wep40), "no handshake -> not applicable");
-        let with = BssidWep::with_material(WepMaterial { ska_keystream: Some(vec![0u8; 40]), ..Default::default() });
-        assert!(SkaAttack::default().applicable(&with, KeyLen::Wep40), "a captured handshake -> applicable");
+        // captured -- a record without one is left to the ordinary statistical path
+        // -- and only when the pool the handshake joins can converge: the handshake
+        // is one sample among the thousands the sigma vote needs (FR-OUT-5).
+        let pool = |n: u32, handshake: bool| {
+            BssidWep::with_material(WepMaterial {
+                ivs: (0..n).map(|c| IvSample::new([c as u8, (c >> 8) as u8, 0], &[0u8; 8])).collect(),
+                ska_keystream: handshake.then(|| vec![0u8; 40]),
+                ..Default::default()
+            })
+        };
+        let ska = SkaAttack::default();
+        assert!(!ska.applicable(&BssidWep::default(), KeyLen::Wep40), "no handshake -> not applicable");
+        assert!(!ska.applicable(&pool(1000, false), KeyLen::Wep40), "a rich pool but no handshake -> PTW's job");
+        assert!(!ska.applicable(&pool(0, true), KeyLen::Wep40), "a handshake alone cannot converge");
+        assert!(!ska.applicable(&pool(999, true), KeyLen::Wep40), "nor can a pool below the floor");
+        assert!(ska.applicable(&pool(1000, true), KeyLen::Wep40), "handshake + a pool at the floor -> applicable");
     }
 
     #[test]

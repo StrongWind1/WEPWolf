@@ -54,10 +54,6 @@ impl Attack for KorekAttack {
         super::worth_attempting(bssid, len)
     }
 
-    fn needs_convergence(&self) -> bool {
-        true
-    }
-
     fn run(&self, bssid: &BssidWep, len: KeyLen, verifier: &Verifier) -> Option<WepKey> {
         let n = len.byte_len();
         let alnum = self.tuning.alnum;

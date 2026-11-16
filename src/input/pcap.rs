@@ -251,11 +251,18 @@ impl<R: Read> PacketReader for PcapReader<R> {
             needed: 12,
             got: 8,
         })?;
-        // orig_len bytes[12..16] are parsed but not used; incl_len is what was captured.
+        // orig_len bytes[12..16]: the on-the-wire length. incl_len is what was
+        // captured; a larger orig_len marks a packet cut short at the snap length.
+        let orig_len_bytes: [u8; 4] = hdr.get(12..16).and_then(|s| s.try_into().ok()).ok_or(Error::Truncated {
+            context: "pcap packet header orig_len",
+            needed: 16,
+            got: 12,
+        })?;
 
         let ts_sec = self.byte_order.u32(ts_sec_bytes);
         let ts_usec = self.byte_order.u32(ts_usec_bytes);
         let incl_len = self.byte_order.u32(incl_len_bytes);
+        let orig_len = self.byte_order.u32(orig_len_bytes);
 
         // --- Consume Kuznetzov extra bytes (index, protocol, pkt_type, pad) ---
         // [libpcap sf-pcap.c:167-174] The 8 bytes after orig_len are discarded.
@@ -309,7 +316,7 @@ impl<R: Read> PacketReader for PcapReader<R> {
             u64::from(ts_sec) * 1_000_000 + u64::from(ts_usec)
         };
 
-        Ok(Some(Packet { timestamp_us, interface_id: 0, data }))
+        Ok(Some(Packet { timestamp_us, interface_id: 0, data, orig_len }))
     }
 
     /// Returns the DLT for the given interface id.

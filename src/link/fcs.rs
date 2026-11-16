@@ -74,6 +74,42 @@ pub fn resolve(frame: &[u8], header_says_fcs: bool, badfcs_flagged: bool) -> Fcs
     }
 }
 
+/// Whether the trailing 4 bytes of `frame` are an FCS to strip: the strip decision
+/// of [`resolve`], without the diagnostic label.
+///
+/// [`resolve`] tells five outcomes apart, but every one in which the header
+/// announces an FCS strips, whatever the CRC says -- the CRC only picks the label.
+/// The CRC decides the strip in a single case: a frame whose header does *not*
+/// announce an FCS. So this is exactly `resolve(frame, header_says_fcs,
+/// _).should_strip()`, computed without the CRC pass whenever that pass cannot
+/// change the answer. A caller that keeps no per-outcome FCS accounting uses this
+/// and skips a CRC-32 over most frames of a radiotap capture.
+#[must_use]
+pub fn should_strip(frame: &[u8], header_says_fcs: bool) -> bool {
+    header_says_fcs || verify_crc32(frame)
+}
+
+/// Octets of FCS still present at the end of a frame cut `missing` octets short.
+///
+/// All four when the frame is complete, fewer as the cut reaches into the FCS,
+/// and none once it has taken the whole FCS (and more).
+#[must_use]
+pub const fn fcs_octets_captured(missing: u32) -> usize {
+    match missing {
+        0 => MIN_FCS_LEN,
+        1 => 3,
+        2 => 2,
+        3 => 1,
+        _ => 0,
+    }
+}
+
+/// Strips the trailing `octets` FCS bytes from `frame`.
+#[must_use]
+pub fn strip_tail(frame: &[u8], octets: usize) -> &[u8] {
+    frame.get(..frame.len().saturating_sub(octets)).unwrap_or(frame)
+}
+
 /// Strips the trailing 4-byte FCS from `frame` if `outcome` says to.
 /// Returns the frame unchanged if no strip is needed.
 #[must_use]
@@ -215,6 +251,52 @@ mod tests {
         let mut frame = msg.to_vec();
         frame.extend_from_slice(&crc.to_le_bytes());
         assert_eq!(resolve(&frame, false, false), FcsOutcome::CrcDetected);
+    }
+
+    // --- should_strip / strip_tail ---
+
+    #[test]
+    fn should_strip_matches_resolve_in_every_case() {
+        // The short-circuit decision must equal resolve().should_strip() for every
+        // header signal, BADFCS flag, CRC outcome, and frame length -- including
+        // frames too short to hold an FCS.
+        let msg = b"frame body for the strip decision";
+        let mut valid = msg.to_vec();
+        valid.extend_from_slice(&crc32fast::hash(msg).to_le_bytes());
+        let mut invalid = msg.to_vec();
+        invalid.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        let frames: [&[u8]; 6] = [&valid, &invalid, msg, &[], &[0x01, 0x02, 0x03], &crc32fast::hash(b"").to_le_bytes()];
+        for frame in frames {
+            for header_says_fcs in [false, true] {
+                for badfcs in [false, true] {
+                    let outcome = resolve(frame, header_says_fcs, badfcs);
+                    let strip = should_strip(frame, header_says_fcs);
+                    assert_eq!(strip, outcome.should_strip(), "len {} header {header_says_fcs}", frame.len());
+                    let octets = if strip { fcs_octets_captured(0) } else { 0 };
+                    assert_eq!(
+                        strip_tail(frame, octets),
+                        strip_fcs(frame, outcome),
+                        "len {} header {header_says_fcs}",
+                        frame.len()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_cut_frame_keeps_only_the_fcs_octets_it_still_holds() {
+        // The FCS is the last four octets of the frame as transmitted. A capture that
+        // cut the frame short holds fewer of them, and none once the cut is four
+        // octets or more -- stripping four from such a frame would eat real data.
+        assert_eq!(fcs_octets_captured(0), 4);
+        assert_eq!(fcs_octets_captured(1), 3);
+        assert_eq!(fcs_octets_captured(3), 1);
+        assert_eq!(fcs_octets_captured(4), 0);
+        assert_eq!(fcs_octets_captured(900), 0);
+        assert_eq!(strip_tail(b"payload\x01\x02", fcs_octets_captured(2)), b"payload");
+        assert_eq!(strip_tail(b"payload", fcs_octets_captured(64)), b"payload");
+        assert_eq!(strip_tail(b"ab", 4), b"", "a frame shorter than the strip leaves nothing");
     }
 
     // --- strip_fcs ---

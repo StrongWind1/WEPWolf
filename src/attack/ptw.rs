@@ -30,10 +30,6 @@ impl Attack for PtwAttack {
         super::worth_attempting(bssid, len)
     }
 
-    fn needs_convergence(&self) -> bool {
-        true
-    }
-
     fn run(&self, bssid: &BssidWep, len: KeyLen, verifier: &Verifier) -> Option<WepKey> {
         // Every data frame's SNAP keystream feeds PTW; ARP/IP frames add longer ones.
         recover(bssid.ivs(), bssid.arp_keystreams(), len.byte_len(), verifier, self.tuning.brute_tail, W_MP)

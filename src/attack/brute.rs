@@ -12,9 +12,11 @@ use crate::wep::{KnownPrefix, Verifier};
 const SPACE_40: u64 = 1 << 40;
 
 /// Independent RC4 lanes the prefilter batches at once. Enough to overlap each
-/// lane's data-dependent S-box latency (cross-lane ILP); the `LANES` S-boxes
-/// (`LANES` * 256 octets) stay comfortably within L1.
-pub(crate) const LANES: usize = 16;
+/// lane's data-dependent S-box latency (cross-lane ILP); the gain flattens past
+/// this point and then reverses as the lanes outgrow the registers and the
+/// store buffer, and the `LANES` S-boxes (about 1 KiB each, one octet per `u32`
+/// slot) stay comfortably within L1.
+pub(crate) const LANES: usize = 8;
 
 /// Known-plaintext octets compared per candidate (the LLC/SNAP prefix). Four
 /// octets reject a wrong key with probability `1 - 2^-32`, so over the 2^40 space

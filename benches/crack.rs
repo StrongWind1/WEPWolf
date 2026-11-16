@@ -19,11 +19,12 @@ use crc32fast as _;
 use flate2 as _;
 use indicatif as _;
 use md5 as _;
-use rayon as _;
 use sysinfo as _;
 
 use std::hint::black_box;
 use std::time::Instant;
+
+use rayon::iter::{IntoParallelIterator as _, ParallelIterator as _};
 
 use wepwolf::attack::Attack;
 use wepwolf::attack::brute::{CpuBrute, SimdBrute};
@@ -38,6 +39,37 @@ fn main() {
     bench_ptw();
     bench_crc();
     bench_brute();
+    bench_brute_parallel();
+}
+
+/// The brute force as the engine runs it: the prefiltered search on every pool
+/// thread at once. Reports whole-machine keys/sec and what that makes of a full
+/// 2^40 sweep -- the number behind the feasibility table (`02-architecture.md` §2)
+/// and the user-facing "how long does --brute take" (FR-PERF-4, FR-BRUTE-1).
+fn bench_brute_parallel() {
+    const CHUNK: u64 = 1 << 20;
+    // A fixed count of chunks per thread, so the timing window is about the same
+    // length whatever the core count.
+    const CHUNKS_PER_THREAD: u64 = 12;
+    let key = [0xaau8, 0xbb, 0xcc, 0xdd, 0xee]; // far outside the scanned window
+    let verifier = verifier_for(&key);
+    let backend = SimdBrute::new();
+    let threads = rayon::current_num_threads() as u64;
+    let chunks = threads * CHUNKS_PER_THREAD;
+    let start = Instant::now();
+    let hits = (0..chunks)
+        .into_par_iter()
+        .filter(|c| backend.search40(&verifier, KeyRange { start: c * CHUNK, end: (c + 1) * CHUNK }).is_some())
+        .count();
+    let elapsed = start.elapsed();
+    assert_eq!(hits, 0, "the key is outside the window");
+    let rate = (chunks * CHUNK) as f64 / elapsed.as_secs_f64();
+    let sweep_hours = (1u64 << 40) as f64 / rate / 3600.0;
+    println!(
+        "brute_{:<10}_{threads}threads  {elapsed:?}  {:.1}M keys/s  (full 2^40 sweep: {sweep_hours:.1} h)",
+        backend.label(),
+        rate / 1e6
+    );
 }
 
 /// Time PTW recovery of a WEP-40 key from 80k synthetic ARP keystreams -- the

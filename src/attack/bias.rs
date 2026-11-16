@@ -414,10 +414,6 @@ impl Attack for BiasAttack {
         super::worth_attempting(bssid, len)
     }
 
-    fn needs_convergence(&self) -> bool {
-        true
-    }
-
     fn run(&self, bssid: &BssidWep, len: KeyLen, verifier: &Verifier) -> Option<WepKey> {
         let n = len.byte_len();
         // Distinct IVs only -- a reused IV repeats its votes and biases the table.

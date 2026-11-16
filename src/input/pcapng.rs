@@ -398,9 +398,17 @@ impl<R: Read> PcapngReader<R> {
                 let ts_high = self.byte_order.u32(read_array(&self.block_buf, 4, "pcapng EPB ts_high")?);
                 let ts_low = self.byte_order.u32(read_array(&self.block_buf, 8, "pcapng EPB ts_low")?);
                 let caplen = self.byte_order.u32(read_array(&self.block_buf, 12, "pcapng EPB caplen")?);
+                // Original Packet Length: larger than caplen when the packet was cut
+                // short at the interface's snap length. [draft-ietf-opsawg-pcapng] §4.3
+                let orig_len = self.byte_order.u32(read_array(&self.block_buf, 16, "pcapng EPB origlen")?);
 
                 let Some(iface) = self.interfaces.get(interface_id as usize) else {
-                    return Ok(BlockOutcome::Packet(Packet { timestamp_us: 0, interface_id, data: Vec::new() }));
+                    return Ok(BlockOutcome::Packet(Packet {
+                        timestamp_us: 0,
+                        interface_id,
+                        data: Vec::new(),
+                        orig_len: 0,
+                    }));
                 };
 
                 let ts_raw = (u64::from(ts_high) << 32) | u64::from(ts_low);
@@ -431,7 +439,7 @@ impl<R: Read> PcapngReader<R> {
                 };
                 data.extend_from_slice(src);
 
-                Ok(BlockOutcome::Packet(Packet { timestamp_us, interface_id, data }))
+                Ok(BlockOutcome::Packet(Packet { timestamp_us, interface_id, data, orig_len }))
             },
             _ => {
                 // SPB, NRB, ISB, Custom, and any future block types are transparently skipped.

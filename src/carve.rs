@@ -66,11 +66,16 @@ impl Carver {
 
     /// Write a WEP crack frame now (timestamp zeroed). Best-effort: the first
     /// error is stored and surfaced by [`Carver::finish`].
-    pub fn wep_frame(&mut self, frame: &[u8]) {
+    ///
+    /// `missing` is how many octets the source capture cut off the frame's end (0
+    /// when it is complete). It is carried into the record's original length, so a
+    /// frame that was cut short still reads as cut short when the carved file is
+    /// cracked again -- by wepwolf, which then does not mistake its tail for an ICV.
+    pub fn wep_frame(&mut self, frame: &[u8], missing: u32) {
         if self.err.is_some() {
             return;
         }
-        match self.write_record(frame) {
+        match self.write_record(frame, missing) {
             Ok(()) => self.written += 1,
             Err(e) => self.err = Some(e),
         }
@@ -93,7 +98,7 @@ impl Carver {
         for (mac, frames) in &beacons {
             if self.err.is_none() && bssids.get(mac).is_some_and(|b| b.encryption() == Encryption::Wep) {
                 for frame in frames {
-                    match self.write_record(frame) {
+                    match self.write_record(frame, 0) {
                         Ok(()) => self.written += 1,
                         Err(e) => {
                             self.err = Some(e);
@@ -110,13 +115,14 @@ impl Carver {
         }
     }
 
-    /// Write one pcap record with a zeroed timestamp and the frame verbatim.
-    fn write_record(&mut self, frame: &[u8]) -> io::Result<()> {
+    /// Write one pcap record with a zeroed timestamp and the frame verbatim. The
+    /// original length is the frame plus the `missing` octets its source lost.
+    fn write_record(&mut self, frame: &[u8], missing: u32) -> io::Result<()> {
         let len = u32::try_from(frame.len()).map_err(|_| io::Error::other("frame exceeds pcap record length"))?;
         self.out.write_all(&0u32.to_le_bytes())?; // ts_sec = 0
         self.out.write_all(&0u32.to_le_bytes())?; // ts_usec = 0
         self.out.write_all(&len.to_le_bytes())?; // incl_len
-        self.out.write_all(&len.to_le_bytes())?; // orig_len
+        self.out.write_all(&len.saturating_add(missing).to_le_bytes())?; // orig_len
         self.out.write_all(frame)
     }
 }
@@ -143,7 +149,7 @@ mod tests {
         bssids.insert(ap, rec);
 
         let mut carver = Carver::create(&path).unwrap();
-        carver.wep_frame(&[0xAA; 40]); // a crack frame, written now
+        carver.wep_frame(&[0xAA; 40], 0); // a crack frame, written now
         carver.beacon(ap, &[0xBB; 30]); // a beacon, written at finish (WEP BSSID)
         let written = carver.finish(&bssids).unwrap();
         assert_eq!(written, 2, "one crack frame + one WEP beacon");
@@ -155,6 +161,25 @@ mod tests {
         assert_eq!(bytes.len(), 24 + (16 + 40) + (16 + 30));
         // Timestamps are zeroed.
         assert_eq!(&bytes[24..32], &[0u8; 8]);
+    }
+
+    #[test]
+    fn a_cut_frame_keeps_its_original_length() {
+        // FR-OUT-6: a frame the source capture cut short is written with an original
+        // length that still exceeds its captured length, so re-reading the carved
+        // file does not take it for a complete frame.
+        let dir = std::env::temp_dir().join(format!("wepwolf-carve3-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("carve.pcap");
+        let mut carver = Carver::create(&path).unwrap();
+        carver.wep_frame(&[0xAA; 40], 0);
+        carver.wep_frame(&[0xCC; 60], 1440);
+        assert_eq!(carver.finish(&BTreeMap::new()).unwrap(), 2);
+        let bytes = std::fs::read(&path).unwrap();
+        let u32_at = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+        assert_eq!((u32_at(32), u32_at(36)), (40, 40), "complete frame: incl_len == orig_len");
+        let second = 24 + 16 + 40;
+        assert_eq!((u32_at(second + 8), u32_at(second + 12)), (60, 1500), "cut frame: orig_len = incl_len + missing");
     }
 
     #[test]

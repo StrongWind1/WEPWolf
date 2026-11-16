@@ -41,6 +41,11 @@ impl Attack for KeygenAttack {
         !self.words.is_empty()
     }
 
+    /// The derived keys are fixed per passphrase, so the full pass would only repeat the quick one.
+    fn single_pass(&self) -> bool {
+        true
+    }
+
     fn run(&self, _bssid: &BssidWep, len: KeyLen, verifier: &Verifier) -> Option<WepKey> {
         for word in &self.words {
             match len {

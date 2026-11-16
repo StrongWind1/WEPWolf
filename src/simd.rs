@@ -87,6 +87,29 @@ pub fn crc32(tier: SimdTier, data: &[u8]) -> u32 {
     }
 }
 
+/// The streaming form of [`crc32`], for a caller that produces its data in blocks.
+///
+/// The verifier decrypts a frame a block at a time and folds each block as it
+/// goes, so no decrypted copy of the frame is ever assembled. Feeding the blocks
+/// through here yields exactly the CRC-32 that [`crc32`] gives for their
+/// concatenation, on every tier (FR-SIMD-2) -- it is the same `crc32fast` fold,
+/// which picks its PCLMULQDQ or table kernel at runtime.
+#[derive(Debug, Clone, Default)]
+pub struct Crc32Fold(crc32fast::Hasher);
+
+impl Crc32Fold {
+    /// Fold `data` into the running CRC.
+    pub fn update(&mut self, data: &[u8]) {
+        self.0.update(data);
+    }
+
+    /// The CRC-32 of everything folded so far.
+    #[must_use]
+    pub fn finish(self) -> u32 {
+        self.0.finalize()
+    }
+}
+
 /// The richest SIMD tier this CPU supports, detected once and cached.
 ///
 /// `is_x86_feature_detected!` already caches its CPUID probe, but memoising the
@@ -118,10 +141,11 @@ pub fn rc4_keystream(tier: SimdTier, key: &[u8], out: &mut [u8]) {
 /// RC4's KSA is a data-dependent S-box gather/scatter, which x86 vector
 /// gather/scatter does not accelerate -- `vpgatherdd`/`vpscatterdd` retire one
 /// element per micro-op, so a vectorised lane is no faster than a scalar one --
-/// so every tier runs the one portable lane-interleaved kernel, whose speed comes
-/// from cross-lane ILP and (in the brute) prefix rejection rather than vector
-/// lanes. Routing every tier to the same kernel keeps it byte-exact with the
-/// scalar oracle (FR-SIMD-2); the detected `tier` still labels the active backend.
+/// so every tier runs the one portable lane-interleaved kernel
+/// (`crate::crypto::rc4::Rc4Lanes`), whose speed comes from cross-lane ILP and
+/// (in the brute) prefix rejection rather than vector lanes. Routing every tier to
+/// the same kernel keeps it byte-exact with the scalar oracle (FR-SIMD-2); the
+/// detected `tier` still labels the active backend.
 pub fn rc4_prefix_batch<const LANES: usize, const PFX: usize>(
     tier: SimdTier,
     seeds: &[[u8; 8]; LANES],
