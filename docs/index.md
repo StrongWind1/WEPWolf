@@ -13,14 +13,14 @@ WEPWolf reads a pcap, pcapng, or gzip-compressed capture, pulls the WEP-encrypte
 - **One tool, one file.** It ingests an entire directory of captures in parallel, merges a network's frames across every file deterministically, and can carve the exact WEP frame set it cracks from into a single re-crackable pcap.
 - **One acceptance path.** A key is accepted only after RC4-decrypting at least two retained frames and matching the transmitted CRC-32 ICV -- the same standard aircrack-ng applies, so a reported key is correct, not merely "likely".
 - **Real key sizes only.** WEP-40, WEP-104, and WEP-232 (5 / 13 / 29 secret octets). The 16-octet "152-bit" vendor extension is rejected.
-- **Fast and lean.** A work-stealing sweep cracks every network in parallel, the CRC-32 ICV folds on PCLMULQDQ, and the 40-bit brute (when you ask for it) runs a SIMD-batched known-plaintext prefilter.
+- **Every network gets a real attempt.** A built-in list of common and default keys, key reuse, and the potfile are tried on every network, however little traffic it has. The statistical attacks run where the capture holds enough distinct IVs to converge, and a network that falls short is reported as too thin, with the shortfall, instead of being spun on.
+- **Known plaintext only where it is known.** Fragments and frames cut short by a snap length are told apart from whole ones, so they neither add noise to the votes nor stand in the way of a correct key verifying.
+- **Fast and lean.** A work-stealing sweep cracks every network in parallel, each candidate key's frames are decrypted side by side on interleaved RC4 lanes, the CRC-32 ICV folds on PCLMULQDQ, and the 40-bit brute (when you ask for it) runs a batched known-plaintext prefilter.
 
 ## Quick start
 
 ```sh
-git clone https://github.com/StrongWind1/WEPWolf
-cd WEPWolf
-make release                 # -> target/release/wepwolf
+cargo install wepwolf        # or grab a prebuilt binary, or build from source
 
 wepwolf capture.cap          # scan, enumerate BSSIDs, and crack the WEP networks
 ```
@@ -28,13 +28,14 @@ wepwolf capture.cap          # scan, enumerate BSSIDs, and crack the WEP network
 ```text
 $ wepwolf wep_64_ptw.cap
 KEYS RECOVERED
-BSSID              ESSID             BITS  ID  VIA              IVS    TIME  KEY
-00:12:bf:12:32:29  Appart              40   0  ptw            30566   0.03s  1f:1f:1f:1f:1f
+BSSID              ESSID               BITS  ID  VIA              IVS     TIME  KEY
+00:12:bf:12:32:29  Appart                40   0  ptw            30566    0.02s  1f:1f:1f:1f:1f
 
 WEP BSSIDs (most IVs first):
 BSSID                   IVS  VIA         ESSID
 00:12:bf:12:32:29     30566  ptw         Appart
 (1 WEP, 0 WPA, 0 open, 0 unknown BSSIDs observed; --json for all)
+
 === WEPWolf ====================================================
 -- ingest ------------------------------------------------------
 captures read ............................................: 1
@@ -42,7 +43,7 @@ packets total ............................................: 65282
 ...
 ```
 
-That crack runs in a fraction of a second. See the [installation guide](getting-started/installation.md) to build it, then the [guide](guide/index.md) for the full workflow.
+That crack runs in a fraction of a second. See the [installation guide](getting-started/installation.md) for the three ways to get the binary, then the [guide](guide/index.md) for the full workflow.
 
 ## How it works
 

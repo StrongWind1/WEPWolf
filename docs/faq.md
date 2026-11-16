@@ -10,11 +10,21 @@ WEPWolf operates on capture files you already possess. Running it on traffic you
 
 ## Does it need a wordlist?
 
-No. WEP's design leaks the key statistically, so WEPWolf recovers most keys from the captured IVs alone with no wordlist. A wordlist (`-w`) only adds the dictionary and passphrase-generator attacks, which help when the key is a known or guessable passphrase.
+No. WEP's design leaks the key statistically, so WEPWolf recovers most keys from the captured IVs alone with no wordlist. It also tries a short built-in list of common and default keys on every network, so a network left on `1234567890` cracks from a handful of frames. A wordlist (`-w`) adds your own candidates to that list and enables the passphrase-generator attack, which help when the key is a known or guessable passphrase.
 
 ## Why didn't my capture crack?
 
-Almost always: too few **distinct** IVs. WEP recovery is statistical and scales with unique IVs, and WEP reuses its 24-bit IV heavily, so a capture can have many frames but little real material. Run with `--debug` -- WEPWolf prints, per uncracked network, the distinct-IV count, the feasibility floor, and how far short you are. The practical floors are roughly a few thousand distinct IVs for WEP-40, tens of thousands for WEP-104, and more for WEP-232. The fix is more capture; see [Tuning & performance](guide/tuning.md).
+Almost always: too few **distinct** IVs. WEP recovery is statistical and scales with unique IVs, and WEP reuses its 24-bit IV heavily, so a capture can have many frames but little real material. Run with `--debug` -- WEPWolf prints, per uncracked network, the distinct-IV count, the floor, and how far short you are.
+
+The statistical attacks are not even started below 1,000 distinct IVs for WEP-40 (5,000 for WEP-104, 15,000 for WEP-232), because they cannot converge there. Being above the floor makes a crack possible, not likely: in the best case a WEP-40 key falls 6% of the time at 5,000 distinct IVs, 44% at 8,000, and 97% at 20,000, and a WEP-104 key wants several tens of thousands. The fix is more capture. More time rarely substitutes for it -- at 5,000 distinct IVs, four times the time budget cracked no more WEP-40 keys -- though a larger `--per-bssid-time-max` can help a WEP-104 key on a capture that already has plenty of IVs; see [Tuning & performance](guide/tuning.md).
+
+## I have a capture with only a few frames. Is it worth running?
+
+Yes. A thin network is still tried against the built-in common keys, your wordlist, every key recovered from other networks in the same run, and the potfile -- none of which need IVs -- and those attempts are near-instant. What it is spared is the statistical search, which could not succeed. If none of them fits and the key is 40-bit, `--brute` is the remaining option.
+
+## How long does `--brute` take?
+
+About six hours for the whole 40-bit keyspace on an 8-core, 16-thread CPU (roughly 50 million keys per second), so three hours on average. Note the default: each network is capped by `--per-bssid-time-max`, 300 seconds unless you change it, and 300 seconds covers only about 1.3% of the keyspace. For a real attempt pass `--per-bssid-time-max 0`, ideally with `--bssid` to aim it at one network. `cargo bench` prints the rate for your own machine. Only WEP-40 can be brute-forced; 2¹⁰⁴ is out of reach.
 
 ## Why is it passive only? aircrack-ng can inject packets to get IVs faster.
 
@@ -42,11 +52,11 @@ Not currently. WEPWolf reads full captures (pcap/pcapng/gzip) and can write a ca
 
 ## Is there a GPU mode?
 
-Not yet. The attacks and the verifier are CPU-SIMD accelerated (PCLMULQDQ CRC-32, a batched-RC4 brute prefilter), and the brute backend has a seam for a future GPU implementation, but none ships today.
+Not yet. Everything runs on the CPU: the verifier and the brute prefilter on interleaved RC4 lanes, the CRC-32 on PCLMULQDQ, all cores in use. The brute backend has a seam for a future GPU implementation, but none ships today.
 
 ## How is it built and tested?
 
-It is a single Rust binary built with `make release` (see [Installation](getting-started/installation.md)). The project is spec-driven: every requirement maps to a test, enforced by `make audit`, and a differential test confirms recovered keys equal aircrack-ng's. `make check-all` runs the full gate.
+It is a single Rust binary: `cargo install wepwolf`, a prebuilt release binary, or `make release` from source (see [Installation](getting-started/installation.md)). The project is spec-driven: every requirement maps to a test, enforced by `make audit`, and a differential test confirms recovered keys equal aircrack-ng's. Constants that matter -- the distinct-IV floor, the bias weights -- are measured, and the measurement is kept in the repository as a re-runnable test. `make check-all` runs the full gate.
 
 ## Where do I report bugs or contribute?
 

@@ -36,13 +36,15 @@ It is **passive and offline**: it operates on capture files you already have on 
 | **PTW** (Tews-Weinmann-Pyshkin / Klein) | ordinary captured traffic; the headline attack | yes |
 | **KoreK** (17 correlations) | weak IVs (fewer than FMS needs) | yes |
 | **FMS** (Fluhrer-Mantin-Shamir) | weak IVs | yes |
-| **Dictionary** (`--wordlist`) | a wordlist of candidate keys (raw or hex) | yes |
+| **Dictionary** | a built-in list of common and default keys, tried on every network, plus your `--wordlist` (each entry raw and hex-decoded) | yes |
 | **Keygen** (`--wordlist`) | passphrases via Neesus-Datacom (40-bit) and MD5 (104-bit) | yes |
 | **RC4-bias** (Sepehrdad "Smashing WEP" database) | many RC4 biases voted together; recovers from fewer packets than PTW, and aircrack-ng does not ship it | yes |
-| **Brute force** (`--brute`) | exhaustive WEP-40 (last resort, slow) | yes |
+| **Brute force** (`--brute`) | exhaustive WEP-40 (last resort: about six hours for the whole keyspace on an 8-core CPU) | yes |
 | Shared-Key-auth keystream | the WEP-encrypted SKA frame 3, fed to the attacks above | yes |
 
 Every candidate key is confirmed by RC4-decrypting real frames and checking the CRC-32 ICV before it is reported -- there is no heuristic acceptance.
+
+The statistical attacks (PTW, KoreK, FMS, RC4-bias) need IVs: they run on a network once it has 1,000 distinct IVs for WEP-40 (5,000 / 15,000 for WEP-104 / 232), because below that they cannot converge -- measured, no random WEP-40 key fell at 3,000 distinct IVs or fewer even with fully known keystream, while 20,000 cracked 97%. The dictionary, key reuse, the potfile, and the brute force need none and try every network.
 
 ---
 
@@ -51,13 +53,14 @@ Every candidate key is confirmed by RC4-decrypting real frames and checking the 
 ```text
 $ wepwolf wep_64_ptw.cap
 KEYS RECOVERED
-BSSID              ESSID             BITS  ID  VIA              IVS    TIME  KEY
-00:12:bf:12:32:29  Appart              40   0  ptw            30566   0.03s  1f:1f:1f:1f:1f
+BSSID              ESSID               BITS  ID  VIA              IVS     TIME  KEY
+00:12:bf:12:32:29  Appart                40   0  ptw            30566    0.02s  1f:1f:1f:1f:1f
 
 WEP BSSIDs (most IVs first):
 BSSID                   IVS  VIA         ESSID
 00:12:bf:12:32:29     30566  ptw         Appart
 (1 WEP, 0 WPA, 0 open, 0 unknown BSSIDs observed; --json for all)
+
 === WEPWolf ====================================================
 -- ingest ------------------------------------------------------
 captures read ............................................: 1
@@ -107,20 +110,20 @@ Options:
 
 Targeting & attacks:
   -w, --wordlist <FILE>  Wordlist for the dictionary and keygen attacks (one candidate per line)
-  -n, --keylen <BITS>    Only try one key strength in bits: 40, 104, or 232 (default: all three)
+  -n, --keylen <BITS>    Only try one key strength in bits (default: all three) [possible values: 40, 104, 232]
   -b, --bssid <MAC>      Restrict the run to a single BSSID (e.g. 00:11:22:33:44:55)
-      --brute            Brute-force WEP-40 keys no other attack recovered (slow: scalar 2^40)
+      --brute            Brute-force WEP-40 keys no other attack recovered (slow: 2^40 keys)
 
 Search tuning:
   -f, --fudge <FACTOR>  KoreK/bias fudge factor: keep octets voting >= top/FACTOR (aircrack -f)
-  -x, --bruteforce <N>  Exhaustively sweep the last N key octets (aircrack -x; default 2, max 4)
+  -x, --bruteforce <N>  Exhaustively sweep the last N key octets (aircrack -x; max 4) [default: 2]
   -c, --alnum           Restrict candidate key octets to printable ASCII (aircrack -c)
 
 Performance:
   -j, --threads <N>                     Worker threads for the parallel sweep and ingest (default: all cores)
-      --per-bssid-time-max <SECS>       Max seconds any one network may spend in recovery and brute force (default 300)
-      --total-brute-time-max <SECS>     Max total seconds for the whole 40-bit brute-force phase (default 0: unlimited)
-      --total-recovery-time-max <SECS>  Max total seconds for the whole recovery phase (default 0: unlimited)
+      --per-bssid-time-max <SECS>       Max seconds any one network may spend in recovery and brute force (0: unlimited) [default: 300]
+      --total-brute-time-max <SECS>     Max total seconds for the whole 40-bit brute-force phase (0: unlimited) [default: 0]
+      --total-recovery-time-max <SECS>  Max total seconds for the whole recovery phase (0: unlimited) [default: 0]
 
 Output:
       --plain           Tab-separated records, tagged key / wep / stat (machine-readable)
@@ -144,7 +147,7 @@ The full option reference, output formats, and tuning guide are in the [document
 
 ## How WEP recovery works
 
-WEP encrypts each frame with `RC4(IV || key)`, where the 24-bit IV is sent in the clear. The first octets of an 802.11 data frame are a known LLC/SNAP header, so XORing the ciphertext with that known plaintext recovers the start of the keystream for each IV. Seven octets of SNAP keystream are enough to drive PTW for a 40-bit key; for a 104-bit key PTW needs fifteen, so WEPWolf reconstructs more known plaintext from the predictable start of the encapsulated packet -- the fixed ARP header, the IPv4 header whose total-length field is read straight from the captured frame size, or -- identified from the cleartext 802.11 destination MAC -- the IPv6 Neighbor Discovery and EAPOL headers (mirroring, and extending, aircrack-ng's `known_clear`). PTW then correlates those keystream octets across many packets to vote for the key bytes, fixing the strong leading octets and sweeping the weakest trailing octet exhaustively (aircrack's `-x`); FMS exploits IVs whose RC4 key schedule leaks individual key octets. Beyond PTW and FMS, WEPWolf votes the full Sepehrdad "Smashing WEP" RC4-bias database (FSE 2013), which aircrack-ng does not ship, to recover a key from fewer packets, and it cracks each WEP key slot (Key ID 0-3) separately, so a multi-key access point yields a key per slot. Reliability scales with the number of *distinct* IVs -- WEP reuses its 24-bit IV heavily, and WEPWolf, like aircrack-ng, votes each distinct IV once -- so PTW typically wants on the order of tens of thousands of unique WEP frames.
+WEP encrypts each frame with `RC4(IV || key)`, where the 24-bit IV is sent in the clear. The first octets of an 802.11 data frame are a known LLC/SNAP header, so XORing the ciphertext with that known plaintext recovers the start of the keystream for each IV. Seven octets of SNAP keystream are enough to drive PTW for a 40-bit key; for a 104-bit key PTW needs fifteen, so WEPWolf reconstructs more known plaintext from the predictable start of the encapsulated packet -- the fixed ARP header, the IPv4 header whose total-length field is read straight from the captured frame size, or -- identified from the cleartext 802.11 destination MAC -- the IPv6 Neighbor Discovery and EAPOL headers (mirroring, and extending, aircrack-ng's `known_clear`). Known plaintext is taken only where it really is known: from the first fragment of a packet (a later fragment starts mid-packet), with the length-derived headers only from a whole packet, and a frame the capture cut short at a snap length is never used to confirm a key. PTW then correlates those keystream octets across many packets to vote for the key bytes, fixing the strong leading octets and sweeping the weakest trailing octets exhaustively (aircrack's `-x`, two by default); FMS exploits IVs whose RC4 key schedule leaks individual key octets. Beyond PTW and FMS, WEPWolf votes the full Sepehrdad "Smashing WEP" RC4-bias database (FSE 2013), which aircrack-ng does not ship, to recover a key from fewer packets, and it cracks each WEP key slot (Key ID 0-3) separately, so a multi-key access point yields a key per slot. Reliability scales with the number of *distinct* IVs -- WEP reuses its 24-bit IV heavily, and WEPWolf, like aircrack-ng, votes each distinct IV once -- so a WEP-40 key typically wants ten to twenty thousand unique IVs and a WEP-104 key several tens of thousands.
 
 ---
 
@@ -156,6 +159,8 @@ aircrack-ng is the reference WEP cracker and WEPWolf's ground truth -- every key
 - ingests an entire directory of captures in parallel and merges a network's frames across every file, deterministically;
 - cracks each WEP key slot (Key ID 0-3) separately, recovering keys a single pooled vote table misses;
 - reads the cleartext destination MAC to mine IPv6 Neighbor Discovery and EAPOL known-plaintext the IPv4-shaped guess would miss;
+- tells fragments and snap-length-truncated frames from whole ones, so they neither add noise to the votes nor block a correct key from verifying;
+- tries a built-in list of common and default keys on every network, however few IVs it has;
 - carves the exact WEP frame set it cracks from into one re-crackable pcap.
 
 It is deliberately **passive and offline only** -- the active tools (packet injection, replay, deauthentication) are the aircrack-ng suite's job. The full breakdown is in the [documentation](https://strongwind.dev/WEPWolf/comparison/).
@@ -170,7 +175,7 @@ Conventional commit messages (`feat:`, `fix:`, `docs:`); run `make check` before
 
 ## Credits
 
-[aircrack-ng](https://github.com/aircrack-ng/aircrack-ng) is the reference WEP cracker and the differential oracle every result is checked against. The capture front-end -- container parsing, link-header recovery, and fragment reassembly -- is ported from the sibling [WPAWolf](https://github.com/StrongWind1/WPAWolf).
+[aircrack-ng](https://github.com/aircrack-ng/aircrack-ng) is the reference WEP cracker and the differential oracle every result is checked against. The capture front-end -- container parsing, link-header recovery, and 802.11 frame parsing -- is ported from the sibling [WPAWolf](https://github.com/StrongWind1/WPAWolf).
 
 ---
 

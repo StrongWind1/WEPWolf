@@ -37,11 +37,11 @@ For every BSSID it sees, WEPWolf decides WEP / WPA / open from the beacon Privac
 
 ### 3. Harvest
 
-For each WEP frame, WEPWolf recovers keystream by XORing the ciphertext with **known plaintext**: the LLC/SNAP header that begins every 802.11 data frame, and -- where it can identify the encapsulated protocol -- the longer fixed headers of ARP, IPv4, IPv6 Neighbor Discovery, and EAPOL. Each `(IV, keystream)` pair, tagged with its WEP key slot, is the raw material the statistical attacks consume. See [How it works](how-it-works.md).
+For each WEP frame, WEPWolf recovers keystream by XORing the ciphertext with **known plaintext**: the LLC/SNAP header that begins every 802.11 data packet, and -- where it can identify the encapsulated protocol -- the longer fixed headers of ARP, IPv4, IPv6 Neighbor Discovery, and EAPOL. Each `(IV, keystream)` pair, tagged with its WEP key slot, is the raw material the statistical attacks consume. It also keeps a few complete frames per key slot for the verifier. Plaintext is only taken where it really is known: a later fragment of a fragmented packet starts mid-packet and is not mined, and a frame the capture cut short at a snap length gives up its IV but is never used to confirm a key. See [How it works](how-it-works.md).
 
 ### 4. Attack
 
-Each WEP network is run through every applicable attack, cheapest first, until one produces a key the verifier accepts. The cheap statistical and dictionary attacks run BSSID-parallel (the *sweep*), bounded by a per-network time budget so one hard network cannot starve the run; the optional 40-bit brute force runs one network at a time on the full machine (the *grind*). See [The attacks](attacks.md).
+Each WEP network is run through every applicable attack until one produces a key the verifier accepts. The statistical, dictionary, and keygen attacks run BSSID-parallel (the *recovery* phase), bounded by a per-network time budget so one hard network cannot starve the run; a key found on one network is then tried against the rest; and the optional 40-bit *brute force* runs one network at a time on the full machine. See [The attacks](attacks.md).
 
 ### 5. Verify
 
@@ -55,13 +55,15 @@ WEPWolf prints the recovered keys, a WEP-focused table of the networks (most-IVs
 
 WEP recovery is statistical, and reliability scales with the number of **distinct** IVs (WEP reuses its 24-bit IV heavily, so raw frame counts overstate the material). As a rule of thumb:
 
-| Key length | Practical distinct-IV count |
-|---|---|
-| WEP-40 (5 octets) | a few thousand and up |
-| WEP-104 (13 octets) | tens of thousands |
-| WEP-232 (29 octets) | more still |
+| Key length | Statistical attacks start at | Practical distinct-IV count |
+|---|---|---|
+| WEP-40 (5 octets) | 1,000 | ten to twenty thousand |
+| WEP-104 (13 octets) | 5,000 | several tens of thousands |
+| WEP-232 (29 octets) | 15,000 | more still |
 
-A capture below the floor is reported as "too thin" rather than spun on. If nothing cracks, that is almost always the reason; [Tuning & performance](tuning.md) and the [FAQ](../faq.md) explain how to tell, and `--debug` reports exactly how short a capture falls.
+The middle column is the floor below which the statistical attacks are not run for that key length, because they cannot converge there; the right-hand column is where they start to succeed. Measured on random WEP-40 keys in the best case (every IV with a fully known keystream), nothing cracked at 3,000 distinct IVs or fewer, 6% cracked at 5,000, 44% at 8,000, and 97% at 20,000.
+
+A network below the floor is still attempted -- the built-in list of common and default keys, any `--wordlist`, key reuse, and the potfile need no IVs -- and if none of those finds the key it is reported as "too thin" rather than spun on. If nothing cracks, that is almost always the reason; [Tuning & performance](tuning.md) and the [FAQ](../faq.md) explain how to tell, and `--debug` reports exactly how short a capture falls.
 
 ## Next
 

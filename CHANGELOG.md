@@ -2,6 +2,52 @@
 
 All notable changes to WEPWolf are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-11-15
+
+### Changed
+
+- The statistical attacks (PTW, KoreK, FMS, the RC4-bias database, and the Shared-Key bootstrap) run only on a network that holds enough distinct IVs to converge: 1,000 for WEP-40, 5,000 for WEP-104, 15,000 for WEP-232, in both attack passes. Every network is still attempted -- the dictionary with its built-in common keys, the keygen, key reuse, the potfile, and the brute force need no IVs and try them all -- so a weak, default, or reused key on a thin capture is found exactly as before, and at once rather than after the statistical searches have run out their clocks. This narrows the 1.1.0 change that ran every attack on every network. The floor is measured: with random WEP-40 keys and fully known keystream, the statistical attacks recovered 0 of 400 keys at each of seven counts from 8 to 512 distinct IVs, 0 of 160 at 1,000, 0 of 48 at 2,000 and at 3,000, then 6% at 5,000, 44% at 8,000, 97% at 20,000, and 100% at 40,000 (the `iv_floor_study` measurement test reproduces the table). Below the floor each search only ran to its node budget or its deadline; on a 70-million-packet input with about 1,570 thin WEP networks that was a third of the run's CPU time, for no keys.
+- The `IVS` count of a network (the table column and the `ivs` field of `--plain` / `--json`) counts distinct IVs that came with usable known plaintext. A later fragment of a fragmented packet has none and is no longer counted; it is still counted as a WEP frame. In practice this zeroes the count of many one- or two-frame "networks" that were really corrupt frames.
+- Key verification is about two to three times faster on the reject path, which is where the statistical searches, the dictionary, and key reuse spend nearly all their time. A candidate key's retained frames are RC4-decrypted side by side on a lane-interleaved kernel instead of one after another, each frame's CRC-32 is folded as it decrypts (no decrypted copy is assembled), and the check stops as soon as the outcome is settled -- at the second agreeing frame, or once too few frames remain to reach it. The rule is unchanged: a key is accepted only when at least two retained frames decrypt to a valid ICV. On a 70-million-packet multi-file input the recovery phase fell from 2.2 s to 0.9 s with identical results.
+- The 40-bit brute force clears about three times as many keys per second: the batched RC4 prefilter runs eight lanes over word-wide, padded S-boxes (2.3M to 7.2M keys per second per core on the benchmark machine), and the full-verify fallback gains from the faster verifier (0.5M to 1.4M).
+- The dictionary, keygen, and FMS attacks run once per network instead of once in each of the two attack passes. Their candidates do not change between the passes, so the second run only repeated what had just failed -- with a large `--wordlist`, that halves the wordlist work on every uncracked network.
+- Key reuse and potfile seeding run in parallel across networks, with results still reported in network order, and a key recovered on several networks is tried once rather than once per recovery.
+- Ingest skips the FCS CRC-32 where it cannot change the outcome: for control frames, which are only counted, and for frames whose link header already announces an FCS.
+- `--help` says what `--brute` costs: at the default per-network cap it covers only the start of the keyspace (about 1.3% at 50 million keys per second), and a full sweep needs `--per-bssid-time-max 0` and about six hours on an 8-core CPU. Defaults are no longer printed twice in the option summaries. The benchmark (`cargo bench`) reports whole-machine brute throughput and the full-sweep time it implies.
+- Release binaries are built from a clean tree: the release workflow no longer restores a build cache, and the documentation workflow, which publishes the site on a tag, uses none either. The CodeQL action is updated to 4.39.3.
+- The documentation site and the README are brought in line with the tool: installation from crates.io and prebuilt binaries, the phase names (`recovery` / `brute force`), the `-x` default, the built-in dictionary, real output samples, and what the capture formats and the brute force can and cannot do. `Cargo.toml` points its documentation link at the site's current address.
+- Dependencies upgraded: sysinfo 0.40 (its `System` constructor can now fail; the memory monitor treats that as "no reading"), crc32fast 1.5.5, flate2 1.1.11, and three transitive crates.
+
+### Fixed
+
+- A fragment after the first was mined as if it began with the LLC/SNAP header. WEP encrypts every fragment separately and only the first starts with that header, so each later fragment cast one noise vote. Known plaintext is now taken only from first fragments, and the length-derived kind (the ARP test, the IPv4 and IPv6 length fields) only from a whole packet; every fragment still counts as a WEP frame and can still verify a key.
+- A frame the capture had cut short at a snap length could be kept as one of the few frames a key is verified against. Such a frame has lost its ICV, so no key ever satisfies it, and a network whose retained frames were all cut short could not be cracked however many IVs it had -- the right key was found and then rejected. The capture's original packet length is now read (it was parsed and discarded), a cut frame is never retained for verification, its FCS is stripped only as far as the capture still holds it, and `--carve` preserves its original length so the carved file reads the same way.
+- `--brute` could sweep the whole 40-bit space and report nothing for a key that was in it. The known-plaintext prefilter was built from the first retained frame on the assumption that it starts with the LLC/SNAP header, but that frame can be a Shared-Key authentication frame or a later fragment of a fragmented packet, and a prefilter built on the wrong plaintext rejects the true key. The prefilter is now recorded at harvest time, only from a frame whose leading plaintext is fixed by the standard -- the first fragment of a data frame, or the fixed fields of a Shared-Key authentication frame 3 -- and with no such frame the brute verifies every candidate in full.
+
+## [1.2.1] - 2026-07-08
+
+### Changed
+
+- The published crate carries only the source, the build script, the manifest and lockfile, the README, the licence, and this changelog; the test and benchmark trees are no longer packaged.
+
+### Fixed
+
+- The crates.io keyword `802.11` was not a valid keyword and is replaced with `wireless`.
+
+### Security
+
+- crossbeam-epoch updated to 0.9.20 (RUSTSEC-2026-0204).
+
+## [1.2.0] - 2026-07-02
+
+### Added
+
+- A security policy (`SECURITY.md`), a crates.io publish workflow, and a documentation workflow that builds the rustdoc and the MkDocs site on every change and deploys the site on a release tag.
+
+### Changed
+
+- CI, the release tooling, the dependency-update policy, and the repository scaffolding are standardised with the sibling tools. No change to the cracker's behaviour.
+
 ## [1.1.0] - 2026-06-26
 
 ### Added
@@ -83,7 +129,10 @@ All notable changes to WEPWolf are documented here. The format follows [Keep a C
 - WEPWolf is passive and offline: it reads capture files only, and never captures traffic, injects frames, or touches a radio.
 - On the aircrack-ng `wep_64_ptw.cap` reference capture it recovers the key in roughly a fifth of a second.
 
-[Unreleased]: https://github.com/StrongWind1/WEPWolf/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/StrongWind1/WEPWolf/compare/v1.3.0...HEAD
+[1.3.0]: https://github.com/StrongWind1/WEPWolf/compare/v1.2.1...v1.3.0
+[1.2.1]: https://github.com/StrongWind1/WEPWolf/compare/v1.2.0...v1.2.1
+[1.2.0]: https://github.com/StrongWind1/WEPWolf/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/StrongWind1/WEPWolf/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/StrongWind1/WEPWolf/compare/v0.1.0...v1.0.0
 [0.1.0]: https://github.com/StrongWind1/WEPWolf/releases/tag/v0.1.0

@@ -17,7 +17,7 @@ wepwolf ...
 ```
 
 **Output**
-Paste the full output (use `-vvv` for trace-level detail where supported):
+Paste the full output (add `--debug` for the per-network diagnostics; `--log FILE` records parse errors):
 
 ```
 ...

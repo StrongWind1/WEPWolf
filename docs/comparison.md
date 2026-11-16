@@ -26,6 +26,10 @@ WEPWolf also strengthens PTW itself: a second per-packet Maitra-Paul vote alongs
 
 The 802.11 destination MAC stays in the clear even when the payload is encrypted, and group MACs map deterministically to an L3 protocol. WEPWolf reads it to pick the right known plaintext per frame -- which is more information than aircrack-ng's content-based guess. The standout is **IPv6 Neighbor Discovery**: its header is checksum-free and contiguous, so WEPWolf mines a clean 16-octet keystream from frames the IPv4-shaped guess turns into noise.
 
+### Fragments and truncated captures
+
+WEP encrypts every fragment of a fragmented packet separately, and only the first one starts with the known LLC/SNAP header; a capture taken with a snap length holds only the front of each long frame, with the ICV cut off. aircrack-ng's cracker reads neither the fragment number nor the capture's original length, so it mines every such frame as if it were a whole one. WEPWolf takes known plaintext only from first fragments and length-derived plaintext only from whole packets, which keeps noise out of the votes, and it never keeps a cut-short frame as one of the few it verifies a key against -- a set of those would reject the correct key.
+
 ### Per-key-slot cracking
 
 A WEP access point can run up to four keys at once (Key ID 0-3). aircrack-ng keys its vote table by BSSID alone, so a busy slot drowns the others and at most one key is reported. WEPWolf tags every sample with its Key ID and attacks each slot independently, recovering a key per slot.
@@ -39,9 +43,11 @@ A WEP access point can run up to four keys at once (Key ID 0-3). aircrack-ng key
 
 ### Faster and clearer
 
-- **SIMD-batched brute.** When you ask for the 40-bit brute, WEPWolf runs a lane-interleaved known-plaintext prefilter that rejects almost every candidate on its first keystream octets, measured ~4× the throughput of a naive per-key verify.
+- **Lane-interleaved verification.** Checking a candidate key is where a WEP cracker spends its time. WEPWolf decrypts a candidate's retained frames side by side on interleaved RC4 lanes and stops the moment the outcome is settled.
+- **Batched brute.** When you ask for the 40-bit brute, the same lanes run a known-plaintext prefilter that rejects almost every candidate on its first keystream octets -- about 7 million keys per second per core, ~5× a per-key full verify -- and the prefilter is anchored only on a frame whose plaintext is certain.
 - **PCLMULQDQ ICV.** The CRC-32 the verifier runs for every candidate folds on PCLMULQDQ.
-- **Unique-IV feasibility gating.** WEPWolf skips networks below the distinct-IV floor (a replayed capture is frame-rich but IV-poor) instead of spinning on them, and reports *why* each uncracked network failed -- distinct IVs vs raw frames, the shortfall, and the likely cause. aircrack-ng leaves you to infer it.
+- **A default-key check on every network.** A built-in list of common and default keys, reused keys, and the potfile are tried on every WEP network, however little traffic it has.
+- **A measured convergence floor.** The statistical attacks run only where the capture holds enough distinct IVs to converge (a replayed capture is frame-rich but IV-poor), so no time goes to searches that cannot succeed, and WEPWolf reports *why* each uncracked network failed -- distinct IVs vs raw frames, the shortfall, and the likely cause. aircrack-ng leaves you to infer it.
 
 ## A deliberate difference: passive and offline only
 
@@ -57,9 +63,10 @@ If your workflow needs to *generate* IVs on a live network, that is the aircrack
 Truthful comparison cuts both ways:
 
 - **The IPv4 application protocols are recognition, not extra reach.** WEPWolf identifies mDNS / SSDP / IGMP / DHCP from the destination MAC, but their distinguishing bytes sit past the IPv4 header's ID/checksum/source gaps, which the WEP cumulative-sum key chain cannot bridge. So they improve classification precision, not contiguous keystream. IPv6 Neighbor Discovery is the exception that adds real reach.
-- **No GPU brute.** The brute backend is CPU-SIMD; there is no GPU backend yet (the seam exists for one). For a signal-less random WEP-40 key, a GPU would be faster.
+- **No GPU brute.** The brute backend is CPU-only; there is no GPU backend yet (the seam exists for one). A full 2⁴⁰ sweep is about six hours on an 8-core CPU, and for a signal-less random WEP-40 key a GPU would be far faster.
+- **No `.ivs` input.** WEPWolf reads full captures (pcap, pcapng, gzip); it does not read aircrack-ng's compact `.ivs` / `.ivs2` files.
 - **The validation set is favourable.** WEPWolf's parity is proven on the real captures it has been tested against, but a checked-in real passive-IP WEP-104 vector is still missing from the public test set.
 
 ## In one sentence
 
-On an offline capture, WEPWolf matches aircrack-ng's attacks and acceptance standard, then beats it on packet count (the bias database), on multi-file corpora (parallel deterministic ingest plus carving), on multi-key access points (per-slot cracking), and on clarity (it tells you why a capture did not crack) -- while deliberately staying passive and offline.
+On an offline capture, WEPWolf matches aircrack-ng's attacks and acceptance standard, then beats it on packet count (the bias database), on multi-file corpora (parallel deterministic ingest plus carving), on multi-key access points (per-slot cracking), on awkward captures (fragments and truncated frames handled for what they are), and on clarity (it tells you why a capture did not crack) -- while deliberately staying passive and offline.
