@@ -1,6 +1,6 @@
 //! Process memory monitor (FR-MEM-1).
 //!
-//! Samples RSS, tracks the peak for the closing banner, and emits a one-shot `[MEMORY WARNING]` to stderr when RSS crosses a fraction of total RAM. Cross-platform via `sysinfo`. Unlike `WPAWolf`'s monitor this drives no disk-backed fallback (`WEPWolf` holds far less state) -- it is purely diagnostic. The RSS/RAM probes are lifted verbatim from `WPAWolf`'s `progress` helpers (C9).
+//! Samples RSS, tracks the peak for the closing banner, and emits a one-shot `[MEMORY WARNING]` to stderr when RSS crosses a fraction of total RAM. Cross-platform via `sysinfo`. Unlike `WPAWolf`'s monitor this drives no disk-backed fallback (`WEPWolf` holds far less state) -- it is purely diagnostic. The RSS/RAM probes are lifted from `WPAWolf`'s `progress` helpers (C9), with the `sysinfo` 0.40 constructor's failure handled as "no reading".
 
 /// Packets between RSS samples during ingest.
 const CHECK_INTERVAL: u64 = 50_000;
@@ -72,16 +72,21 @@ pub fn current_rss_bytes() -> u64 {
     let Ok(pid) = sysinfo::get_current_pid() else {
         return 0;
     };
-    let mut sys = sysinfo::System::new();
+    let Ok(mut sys) = sysinfo::System::new() else {
+        return 0;
+    };
     let refresh = sysinfo::ProcessRefreshKind::nothing().with_memory();
     sys.refresh_processes_specifics(sysinfo::ProcessesToUpdate::Some(&[pid]), false, refresh);
     sys.process(pid).map_or(0, sysinfo::Process::memory)
 }
 
-/// Total physical RAM in bytes.
+/// Total physical RAM in bytes, or 0 if the probe fails (which leaves the
+/// memory warning disarmed rather than firing on a bogus threshold).
 #[must_use]
 pub fn total_ram_bytes() -> u64 {
-    let mut sys = sysinfo::System::new();
+    let Ok(mut sys) = sysinfo::System::new() else {
+        return 0;
+    };
     sys.refresh_memory_specifics(sysinfo::MemoryRefreshKind::nothing().with_ram());
     sys.total_memory()
 }

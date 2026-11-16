@@ -7,7 +7,7 @@ description = "Offline, passive WEP key recovery from 802.11 captures"
 license = "Apache-2.0"
 repository = "https://github.com/StrongWind1/WEPWolf"
 homepage = "https://github.com/StrongWind1/WEPWolf"
-documentation = "https://strongwind1.github.io/WEPWolf/"
+documentation = "https://strongwind.dev/WEPWolf/"
 readme = "README.md"
 keywords = ["wifi", "security", "wireless", "wep", "pcap"]
 categories = ["command-line-utilities", "network-programming"]
@@ -36,8 +36,8 @@ flate2 = { version = "1", default-features = false, features = [
 # the WEP ICV (which crate::crypto::crc32 computes over the RC4-decrypted body).
 crc32fast = "1"
 # Cross-platform process RSS + total RAM for the FR-MEM-1 memory monitor.
-# Ported from the WPAWolf progress helpers; pinned to match its version.
-sysinfo = "0.39"
+# Ported from the WPAWolf progress helpers.
+sysinfo = "0.40"
 # CLI argument parsing for the oneshot driver. Minimal feature set.
 clap = { version = "4", default-features = false, features = [
   "std",

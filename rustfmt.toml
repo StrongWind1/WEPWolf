@@ -1,5 +1,5 @@
-# rustfmt -- strictest stable settings.
-# Nightly-only options live in rustfmt.nightly.toml and are applied via `make fmt-nightly`.
+# rustfmt -- strictest stable settings. Only options that are stable on the
+# pinned toolchain (rust-toolchain.toml) are set, so `make fmt` needs no nightly.
 edition = "2024"
 max_width = 120
 hard_tabs = false
