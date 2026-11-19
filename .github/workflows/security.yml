@@ -78,7 +78,7 @@ jobs:
           path: |
             ~/.cargo/bin/cargo-deny
             ~/.cargo/advisory-db/
-          key: ubuntu-cargo-deny-v1
+          key: ubuntu-cargo-deny-v2
 
       - name: Install cargo-deny
         run: |
@@ -114,7 +114,7 @@ jobs:
           path: |
             ~/.cargo/bin/cargo-audit
             ~/.cargo/advisory-db/
-          key: ubuntu-cargo-audit-v1
+          key: ubuntu-cargo-audit-v2
 
       - name: Install cargo-audit
         run: |
