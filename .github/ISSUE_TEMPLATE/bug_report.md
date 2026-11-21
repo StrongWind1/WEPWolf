@@ -19,7 +19,7 @@ wepwolf ...
 **Output**
 Paste the full output (add `--debug` for the per-network diagnostics; `--log FILE` records parse errors):
 
-```
+```text
 ...
 ```
 
@@ -27,6 +27,8 @@ Paste the full output (add `--debug` for the per-network diagnostics; `--log FIL
 What you expected to happen.
 
 **Environment**
+Your setup:
+
 - OS: [e.g. Kali 2025.1, Ubuntu 24.04, macOS 14]
 - WEPWolf version: [`wepwolf --version`]
 - Install method: [e.g. release binary, cargo install, built from source]
