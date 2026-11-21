@@ -7,15 +7,16 @@ scripts/
 specs/
 
 # Top-level tools/ holds local-only scratch space (helper scripts, sample
-# captures). Nothing under it is committed yet.
+# captures). The two built-site checkers are the only tracked files under it.
 tools/*
+!tools/check-a11y.js
+!tools/require-site.js
 
 # MkDocs documentation: the source under docs/ is tracked; the built site, the
 # Python venv that builds it, and the resolved lockfile are not.
 /site/
 .venv/
 __pycache__/
-uv.lock
 
 # =============================================================================
 # .gitignore -- Rust/Cargo / VS Code / Linux / macOS / Windows
@@ -241,3 +242,6 @@ System Volume Information/
 # Local bench output
 /target/bench/
 *.egg-info/
+
+# Built-site checkers (npm ci)
+node_modules/
