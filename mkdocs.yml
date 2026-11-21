@@ -1,5 +1,5 @@
 site_name: WEPWolf
-site_description: Offline, passive WEP key recovery from 802.11 captures -- a faster, parity-or-better alternative to aircrack-ng.
+site_description: "Offline, passive WEP key recovery from 802.11 captures"
 site_url: https://strongwind.dev/WEPWolf/
 repo_url: https://github.com/StrongWind1/WEPWolf
 repo_name: StrongWind1/WEPWolf
@@ -56,6 +56,9 @@ theme:
     - content.action.edit
     - content.action.view
 
+hooks:
+  - hooks/html_validity.py
+
 plugins:
   - search
   # Downloads the Google Fonts requested by theme.font at build time so the
@@ -71,7 +74,6 @@ markdown_extensions:
           class: mermaid
           format: !!python/name:pymdownx.superfences.fence_code_format
   - pymdownx.highlight:
-      anchor_linenums: true
       line_spans: __span
       pygments_lang_class: true
   - pymdownx.inlinehilite
@@ -111,6 +113,10 @@ extra_css:
   # theme.css is the site palette; primary and accent are both `custom`,
   # so every Material colour variable is defined there.
   - stylesheets/theme.css
+
+extra_javascript:
+  # a11y.js gives code blocks that scroll sideways a keyboard tab stop.
+  - javascripts/a11y.js
 
 strict: true
 
