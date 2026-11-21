@@ -1,8 +1,6 @@
 <h1 align="center">WEPWolf</h1>
 
-<p align="center">
-  <strong>Recover WEP keys from 802.11 traffic captured in a pcap. Offline, passive, no radio.</strong>
-</p>
+<p align="center"><strong>Recover WEP keys from 802.11 traffic captured in a pcap. Offline, passive, no radio.</strong></p>
 
 <p align="center">
   <a href="https://github.com/StrongWind1/WEPWolf/actions/workflows/ci.yml"><img src="https://github.com/StrongWind1/WEPWolf/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
@@ -13,44 +11,20 @@
 </p>
 
 <p align="center">
-  <a href="#attacks">Attacks</a> &bull;
-  <a href="#example">Example</a> &bull;
-  <a href="#installation">Installation</a> &bull;
-  <a href="#cli-reference">CLI reference</a> &bull;
-  <a href="#how-wepwolf-compares-to-aircrack-ng">vs aircrack-ng</a> &bull;
-  <a href="https://strongwind.dev/WEPWolf/">Docs</a>
+  <a href="https://strongwind.dev/WEPWolf/getting-started/installation/">Installation</a> &bull;
+  <a href="https://strongwind.dev/WEPWolf/#quick-start">Quick start</a> &bull;
+  <a href="https://strongwind.dev/WEPWolf/reference/cli/">CLI reference</a> &bull;
+  <a href="https://strongwind.dev/WEPWolf/comparison/">vs aircrack-ng</a> &bull;
+  <a href="https://strongwind.dev/WEPWolf/">Documentation</a>
 </p>
 
 ---
 
-WEPWolf reads a pcap, pcapng, or gzip-compressed capture, pulls the WEP-encrypted frames out of the 802.11 traffic, and recovers the WEP key from them. Unlike WPA cracking it needs no wordlist and no external cracker: WEP's RC4-with-a-24-bit-IV construction leaks key bytes statistically, so enough captured initialisation vectors (IVs) recover the key directly. The closest existing tool is aircrack-ng, and WEPWolf targets the same attack family -- and on a real capture it recovers the key in a fraction of the time.
-
-It is **passive and offline**: it operates on capture files you already have on disk, never captures traffic, injects frames, or touches a radio.
-
----
-
-## Attacks
-
-| Attack | Recovers from | Status |
-|---|---|---|
-| **PTW** (Tews-Weinmann-Pyshkin / Klein) | ordinary captured traffic; the headline attack | yes |
-| **KoreK** (17 correlations) | weak IVs (fewer than FMS needs) | yes |
-| **FMS** (Fluhrer-Mantin-Shamir) | weak IVs | yes |
-| **Dictionary** | a built-in list of common and default keys, tried on every network, plus your `--wordlist` (each entry raw and hex-decoded) | yes |
-| **Keygen** (`--wordlist`) | passphrases via Neesus-Datacom (40-bit) and MD5 (104-bit) | yes |
-| **RC4-bias** (Sepehrdad "Smashing WEP" database) | many RC4 biases voted together; recovers from fewer packets than PTW, and aircrack-ng does not ship it | yes |
-| **Brute force** (`--brute`) | exhaustive WEP-40 (last resort: about six hours for the whole keyspace on an 8-core CPU) | yes |
-| Shared-Key-auth keystream | the WEP-encrypted SKA frame 3, fed to the attacks above | yes |
-
-Every candidate key is confirmed by RC4-decrypting real frames and checking the CRC-32 ICV before it is reported -- there is no heuristic acceptance.
-
-The statistical attacks (PTW, KoreK, FMS, RC4-bias) need IVs: they run on a network once it has 1,000 distinct IVs for WEP-40 (5,000 / 15,000 for WEP-104 / 232), because below that they cannot converge -- measured, no random WEP-40 key fell at 3,000 distinct IVs or fewer even with fully known keystream, while 20,000 cracked 97%. The dictionary, key reuse, the potfile, and the brute force need none and try every network.
-
----
+WEPWolf reads pcap, pcapng, and gzip captures, pulls out the WEP-encrypted 802.11 frames, and recovers the key with no wordlist and no external cracker: WEP's RC4-with-a-24-bit-IV construction leaks key bytes statistically, so enough captured initialisation vectors (IVs) give up the key directly. It runs the same attack family as aircrack-ng, adds an RC4-bias attack aircrack-ng does not ship, and on a real capture recovers the key in a fraction of the time. It works offline on capture files you already have and never captures traffic, injects frames, or touches a radio.
 
 ## Example
 
-```text
+```console
 $ wepwolf wep_64_ptw.cap
 KEYS RECOVERED
 BSSID              ESSID               BITS  ID  VIA              IVS     TIME  KEY
@@ -68,9 +42,18 @@ packets total ............................................: 65282
 ...
 ```
 
-That crack runs in a fraction of a second. The same keys, summary, and stats are available as tagged TSV (`--plain`) or typed NDJSON (`--json`). Point WEPWolf at a directory to scan many captures at once; networks are cracked in parallel and a key found on one is reused against co-located access points that share it.
+That crack runs in a fraction of a second.
 
----
+## Features
+
+- **Verified keys only**: every candidate key is RC4-decrypted against real frames and must match the CRC-32 ICV of two of them before it is reported; there is no heuristic acceptance.
+- **Whole directories**: point it at a directory and every capture is parsed in parallel, each network's frames are merged across files, and the networks are cracked in parallel.
+- **Key reuse**: a key found on one network is tried against co-located access points that share it, and `--potfile` carries keys forward across runs.
+- **Every network gets a try**: a built-in list of common and default keys runs on every network however few IVs it has; a network too thin for the statistical attacks is reported with its shortfall.
+- **Per key slot**: each WEP key slot (Key ID 0-3) is cracked separately, so a multi-key access point yields a key per slot.
+- **Real key sizes**: WEP-40, WEP-104, and WEP-232 (5, 13, or 29 secret octets).
+- **Scriptable**: tagged TSV (`--plain`) or NDJSON (`--json`), keys only with `--quiet`, and exit code 0 only when a key is recovered.
+- **Frame carving**: `--carve` writes every WEP frame it parsed, from every input, into one raw 802.11 pcap that both WEPWolf and aircrack-ng read.
 
 ## Installation
 
@@ -82,121 +65,92 @@ cargo install wepwolf
 
 ### Prebuilt binaries
 
-Download the binary for your platform from the [latest release](https://github.com/StrongWind1/WEPWolf/releases/latest) and put it on your `PATH`.
+Download the binary for your platform from the [latest release](https://github.com/StrongWind1/WEPWolf/releases/latest) and put it on your `PATH`. The [installation guide](https://strongwind.dev/WEPWolf/getting-started/installation/) lists the assets and how to verify them.
 
 ### From source
-
-Requires a stable Rust toolchain (`rust-toolchain.toml` pins the version).
 
 ```sh
 git clone https://github.com/StrongWind1/WEPWolf
 cd WEPWolf
-make release          # optimised native build -> target/release/wepwolf
+make release      # optimised native build -> target/release/wepwolf
 ```
 
----
+Requires a stable Rust toolchain (pinned in `rust-toolchain.toml`).
 
-## CLI reference
+## Quick start
 
-```text
-wepwolf [OPTIONS] <PATH>...
+```sh
+# Scan one capture and crack its WEP networks
+wepwolf capture.cap
 
-Arguments:
-  <PATH>...  Capture files or directories to scan
+# Recurse a directory of captures (parsed in parallel, merged per BSSID)
+wepwolf /captures/
 
-Options:
-  -h, --help     Print help (see more with '--help')
-  -V, --version  Print version
+# Try a wordlist of keys and passphrases as well as the statistical attacks
+wepwolf -w rockyou.txt capture.cap
 
-Targeting & attacks:
-  -w, --wordlist <FILE>  Wordlist for the dictionary and keygen attacks (one candidate per line)
-  -n, --keylen <BITS>    Only try one key strength in bits (default: all three) [possible values: 40, 104, 232]
-  -b, --bssid <MAC>      Restrict the run to a single BSSID (e.g. 00:11:22:33:44:55)
-      --brute            Brute-force WEP-40 keys no other attack recovered (slow: 2^40 keys)
+# Carry recovered keys forward across runs
+wepwolf --potfile keys.pot /captures/
 
-Search tuning:
-  -f, --fudge <FACTOR>  KoreK/bias fudge factor: keep octets voting >= top/FACTOR (aircrack -f)
-  -x, --bruteforce <N>  Exhaustively sweep the last N key octets (aircrack -x; max 4) [default: 2]
-  -c, --alnum           Restrict candidate key octets to printable ASCII (aircrack -c)
+# Machine-readable output for a pipeline
+wepwolf --json /captures/ > keys.ndjson
 
-Performance:
-  -j, --threads <N>                     Worker threads for the parallel sweep and ingest (default: all cores)
-      --per-bssid-time-max <SECS>       Max seconds any one network may spend in recovery and brute force (0: unlimited) [default: 300]
-      --total-brute-time-max <SECS>     Max total seconds for the whole 40-bit brute-force phase (0: unlimited) [default: 0]
-      --total-recovery-time-max <SECS>  Max total seconds for the whole recovery phase (0: unlimited) [default: 0]
-
-Output:
-      --plain           Tab-separated records, tagged key / wep / stat (machine-readable)
-      --json            NDJSON: one typed object per line (key / bssid / stats)
-  -q, --quiet           Print only the recovered keys (drop the summary and stats)
-      --potfile <FILE>  Read and append recovered keys, hashcat-style (bssid:key_hex)
-      --carve <FILE>    Carve every parsed WEP frame and each WEP beacon into one standalone pcap
-
-Diagnostics:
-  -d, --debug       Emit timestamped diagnostics to stderr
-  -l, --log <FILE>  Write categorized diagnostic lines to FILE
+# Collapse many capture files into one re-crackable pcap
+wepwolf --carve wep-frames.pcap /captures/
 ```
 
-Exit code is `0` iff at least one key was recovered, `1` if none, `2` on a fatal I/O error.
+Every option, the exit codes, and the output formats are in the [CLI reference](https://strongwind.dev/WEPWolf/reference/cli/).
 
-`--carve` collects the WEP frames wepwolf's parser recovers -- across every input file, with its tiered link-header recovery applied -- into one self-contained pcap. Because the frames are written post-strip as raw 802.11 with zeroed timestamps, the output normalises mixed radiotap/Prism/AVS inputs to a single link type that both wepwolf and aircrack-ng read, and many capture files collapse into one capture you can re-crack or hand to another tool.
+## Attacks
 
-The full option reference, output formats, and tuning guide are in the [documentation](https://strongwind.dev/WEPWolf/).
+| Attack | Recovers from | Needs IVs |
+| --- | --- | --- |
+| **PTW** (Tews-Weinmann-Pyshkin / Klein) | ordinary captured traffic; the headline attack | yes |
+| **KoreK** (17 correlations) | weak IVs (fewer than FMS needs) | yes |
+| **FMS** (Fluhrer-Mantin-Shamir) | weak IVs | yes |
+| **RC4-bias** (Sepehrdad "Smashing WEP" database) | many RC4 biases voted together; recovers from fewer packets than PTW, and aircrack-ng does not ship it | yes |
+| Shared-Key-auth keystream | the WEP-encrypted SKA frame 3, fed to the attacks above | yes |
+| **Dictionary** | a built-in list of common and default keys, tried on every network, plus your `--wordlist` (each entry raw and hex-decoded) | no |
+| **Keygen** (`--wordlist`) | passphrases via Neesus-Datacom (40-bit) and MD5 (104-bit) | no |
+| **Brute force** (`--brute`) | exhaustive WEP-40 (last resort: about six hours for the whole keyspace on an 8-core CPU) | no |
 
----
-
-## How WEP recovery works
-
-WEP encrypts each frame with `RC4(IV || key)`, where the 24-bit IV is sent in the clear. The first octets of an 802.11 data frame are a known LLC/SNAP header, so XORing the ciphertext with that known plaintext recovers the start of the keystream for each IV. Seven octets of SNAP keystream are enough to drive PTW for a 40-bit key; for a 104-bit key PTW needs fifteen, so WEPWolf reconstructs more known plaintext from the predictable start of the encapsulated packet -- the fixed ARP header, the IPv4 header whose total-length field is read straight from the captured frame size, or -- identified from the cleartext 802.11 destination MAC -- the IPv6 Neighbor Discovery and EAPOL headers (mirroring, and extending, aircrack-ng's `known_clear`). Known plaintext is taken only where it really is known: from the first fragment of a packet (a later fragment starts mid-packet), with the length-derived headers only from a whole packet, and a frame the capture cut short at a snap length is never used to confirm a key. PTW then correlates those keystream octets across many packets to vote for the key bytes, fixing the strong leading octets and sweeping the weakest trailing octets exhaustively (aircrack's `-x`, two by default); FMS exploits IVs whose RC4 key schedule leaks individual key octets. Beyond PTW and FMS, WEPWolf votes the full Sepehrdad "Smashing WEP" RC4-bias database (FSE 2013), which aircrack-ng does not ship, to recover a key from fewer packets, and it cracks each WEP key slot (Key ID 0-3) separately, so a multi-key access point yields a key per slot. Reliability scales with the number of *distinct* IVs -- WEP reuses its 24-bit IV heavily, and WEPWolf, like aircrack-ng, votes each distinct IV once -- so a WEP-40 key typically wants ten to twenty thousand unique IVs and a WEP-104 key several tens of thousands.
-
----
+The attacks that need IVs start once a network has 1,000 distinct IVs for WEP-40 (5,000 for WEP-104, 15,000 for WEP-232), because below that they cannot [converge](https://strongwind.dev/WEPWolf/guide/how-it-works/#the-convergence-floor). The rest, plus key reuse and the potfile, run on every network. Known plaintext, voting, and key verification are explained in [How it works](https://strongwind.dev/WEPWolf/guide/how-it-works/).
 
 ## How WEPWolf compares to aircrack-ng
 
-aircrack-ng is the reference WEP cracker and WEPWolf's ground truth -- every key WEPWolf reports is differentially validated to match it. WEPWolf re-implements the same attack family (PTW, KoreK, FMS), the same known-plaintext trick (`known_clear`), the same search knobs (`-f` / `-x` / `-c`), the same unique-IV voting, and the same two-frame CRC-32 acceptance standard. On top of that it:
+aircrack-ng is the reference WEP cracker and WEPWolf's ground truth: every key WEPWolf reports is differentially validated to match it. WEPWolf re-implements the same attack family (PTW, KoreK, FMS), the same known-plaintext trick (`known_clear`), the same search knobs (`-f` / `-x` / `-c`), the same unique-IV voting, and the same two-frame CRC-32 acceptance standard. Where they differ:
 
-- ships the full Sepehrdad "Smashing WEP" RC4-bias database that aircrack-ng does not, recovering a WEP-104 key from fewer packets;
-- ingests an entire directory of captures in parallel and merges a network's frames across every file, deterministically;
-- cracks each WEP key slot (Key ID 0-3) separately, recovering keys a single pooled vote table misses;
-- reads the cleartext destination MAC to mine IPv6 Neighbor Discovery and EAPOL known-plaintext the IPv4-shaped guess would miss;
-- tells fragments and snap-length-truncated frames from whole ones, so they neither add noise to the votes nor block a correct key from verifying;
-- tries a built-in list of common and default keys on every network, however few IVs it has;
-- carves the exact WEP frame set it cracks from into one re-crackable pcap.
+| Behaviour | aircrack-ng | WEPWolf |
+| --- | --- | --- |
+| Sepehrdad "Smashing WEP" RC4-bias database | not shipped | full database; recovers a WEP-104 key from fewer packets |
+| Several capture files | read serially | parsed in parallel, a network's frames merged across every file, deterministically |
+| Multi-key access points (Key ID 0-3) | one vote table per BSSID | each key slot cracked separately |
+| Known plaintext | content-based guess | also reads the cleartext destination MAC to mine IPv6 Neighbor Discovery and EAPOL headers |
+| Fragments and snap-length-truncated frames | mined as whole frames | kept out of the votes and out of key verification |
+| Common and default keys | no built-in list | tried on every network, however few IVs it has |
+| Frame carving | no equivalent | `--carve` writes the exact WEP frame set into one re-crackable pcap |
+| Active attacks (injection, replay, deauthentication) | in the aircrack-ng suite | none: passive and offline only |
 
-It is deliberately **passive and offline only** -- the active tools (packet injection, replay, deauthentication) are the aircrack-ng suite's job. The full breakdown is in the [documentation](https://strongwind.dev/WEPWolf/comparison/).
+The full breakdown, including the caveats, is in the [documentation](https://strongwind.dev/WEPWolf/comparison/).
 
----
+## Development
 
-## Contributing
-
-Conventional commit messages (`feat:`, `fix:`, `docs:`); run `make check` before every commit. Every change maps to an `FR-*` requirement and lands a test.
-
----
+Conventional commit messages (`feat:`, `fix:`, `docs:`); run `make check` before every commit. Every change maps to an `FR-*` requirement and lands a test. Release history is in [CHANGELOG.md](CHANGELOG.md).
 
 ## Credits
 
-[aircrack-ng](https://github.com/aircrack-ng/aircrack-ng) is the reference WEP cracker and the differential oracle every result is checked against. The capture front-end -- container parsing, link-header recovery, and 802.11 frame parsing -- is ported from the sibling [WPAWolf](https://github.com/StrongWind1/WPAWolf).
-
----
+[aircrack-ng](https://github.com/aircrack-ng/aircrack-ng) is the reference WEP cracker and the differential oracle every result is checked against. The RC4-bias attack implements the Sepehrdad-Vaudenay-Vuagnoux "Smashing WEP in a Passive Attack" database (FSE 2013). The capture front-end (container parsing, link-header recovery, and 802.11 frame parsing) is ported from the sibling [WPAWolf](https://github.com/StrongWind1/WPAWolf).
 
 ## Related tools
 
-Other projects in this collection:
+- [**WPAWolf**](https://github.com/StrongWind1/WPAWolf): WPA / WPA2 / WPA3 PSK handshake and PMKID extractor for hashcat mode 22000
+- [**WiFi_Cracking**](https://github.com/StrongWind1/WiFi_Cracking): IEEE 802.11 security reference: WPA/WPA2/WPA3 PSK, EAP, and WEP, from protocol internals to cracking
 
-- [WPAWolf](https://github.com/StrongWind1/WPAWolf) - WPA/WPA2/WPA3-FT-PSK handshake extraction from captures
-- [WiFi_Cracking](https://github.com/StrongWind1/WiFi_Cracking) - IEEE 802.11 security reference and attack guide
-- [NFSWolf](https://github.com/StrongWind1/NFSWolf) - native NFS security toolkit
-- [CredWolf](https://github.com/StrongWind1/CredWolf) - Active Directory credential validation
-- [KerbWolf](https://github.com/StrongWind1/KerbWolf) - Kerberos roasting and hash extraction toolkit
-- [NTDSWolf](https://github.com/StrongWind1/NTDSWolf) - offline NTDS.dit parser and credential extractor
-
----
+All tools: [strongwind.dev](https://strongwind.dev)
 
 ## Disclaimer
 
-WEPWolf operates on capture files you already have on disk. It does not capture traffic, inject frames, or touch a radio. It is intended for authorized security research only; running it on captures you do not own or lack written authorization to analyze is illegal in most jurisdictions. The authors are not responsible for any misuse or damage caused by this tool.
-
----
+WEPWolf is for authorized security testing, research, and education. Use it only against systems and data you own or have written permission to test. You are responsible for how you use it.
 
 ## License
 
